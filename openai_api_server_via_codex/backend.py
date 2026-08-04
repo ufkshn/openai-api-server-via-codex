@@ -382,6 +382,7 @@ class CodexHttpBackend:
         if request_id:
             headers["session_id"] = request_id
             headers["x-client-request-id"] = request_id
+        LOGGER.debug(f"codex-http.headers originator={headers.get('originator')} user_agent={headers.get('User-Agent')[:50]}")
         return headers
 
 
