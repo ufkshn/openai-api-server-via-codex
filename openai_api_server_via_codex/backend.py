@@ -131,7 +131,6 @@ class CodexHttpBackend:
     async def stream_response(
         self, payload: dict[str, Any]
     ) -> AsyncIterator[dict[str, Any]]:
-        print(f"[DEBUG] INPUT: model={payload.get('model')} fast_mode={payload.get('fast_mode')} service_tier={payload.get('service_tier')}", flush=True)
         LOGGER.info(
             "codex-http.stream.start model=%s input_items=%d tools=%d base_url=%s timeout=%s",
             payload.get("model"),
@@ -142,13 +141,14 @@ class CodexHttpBackend:
         )
         token, account_id = await self._borrow_key()
         codex_payload = _prepare_codex_payload(payload)
-        print(f"[DEBUG] CODEX PAYLOAD: fast_mode={codex_payload.get('fast_mode')} service_tier={codex_payload.get('service_tier')}", flush=True)
         request_id = codex_payload.get("prompt_cache_key")
         headers = self._headers(
             account_id,
             client_version=self.client_version,
             request_id=request_id if isinstance(request_id, str) else None,
             event_stream=True,
+            fast_mode=payload.get("fast_mode"),
+            service_tier=payload.get("service_tier"),
         )
         client = AsyncOpenAI(
             api_key=token,
@@ -370,6 +370,8 @@ class CodexHttpBackend:
         client_version: str,
         request_id: str | None = None,
         event_stream: bool = False,
+        fast_mode: bool | None = None,
+        service_tier: str | None = None,
     ) -> dict[str, str]:
         headers = {
             "originator": "codex_exec",
@@ -384,7 +386,11 @@ class CodexHttpBackend:
         if request_id:
             headers["session_id"] = request_id
             headers["x-client-request-id"] = request_id
-        print(f"[HEADERS] originator={headers.get('originator')} user_agent={headers.get('User-Agent')[:60]}", flush=True)
+        if fast_mode:
+            headers["X-Fast-Mode"] = "true"
+        if service_tier:
+            headers["X-Service-Tier"] = service_tier
+        print(f"[HEADERS] originator={headers.get('originator')} fast_mode={headers.get('X-Fast-Mode')} service_tier={headers.get('X-Service-Tier')}", flush=True)
         return headers
 
 
@@ -455,6 +461,8 @@ def _list_len(value: Any) -> int:
 def _prepare_codex_payload(payload: dict[str, Any]) -> dict[str, Any]:
     codex_payload = copy.deepcopy(payload)
     codex_payload.pop("max_output_tokens", None)
+    codex_payload.pop("fast_mode", None)
+    codex_payload.pop("service_tier", None)
     codex_payload["stream"] = True
     codex_payload["store"] = False
     codex_payload.setdefault("tool_choice", "auto")
