@@ -147,7 +147,6 @@ class CodexHttpBackend:
             client_version=self.client_version,
             request_id=request_id if isinstance(request_id, str) else None,
             event_stream=True,
-            fast_mode=payload.get("fast_mode"),
             service_tier=payload.get("service_tier"),
         )
         client = AsyncOpenAI(
@@ -370,7 +369,6 @@ class CodexHttpBackend:
         client_version: str,
         request_id: str | None = None,
         event_stream: bool = False,
-        fast_mode: bool | None = None,
         service_tier: str | None = None,
     ) -> dict[str, str]:
         headers = {
@@ -386,11 +384,8 @@ class CodexHttpBackend:
         if request_id:
             headers["session_id"] = request_id
             headers["x-client-request-id"] = request_id
-        if fast_mode:
-            headers["X-Fast-Mode"] = "true"
         if service_tier:
             headers["X-Service-Tier"] = service_tier
-        print(f"[HEADERS] originator={headers.get('originator')} fast_mode={headers.get('X-Fast-Mode')} service_tier={headers.get('X-Service-Tier')}", flush=True)
         return headers
 
 
