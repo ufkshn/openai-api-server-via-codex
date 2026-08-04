@@ -131,7 +131,7 @@ class CodexHttpBackend:
     async def stream_response(
         self, payload: dict[str, Any]
     ) -> AsyncIterator[dict[str, Any]]:
-        print(f"[DEBUG] stream_response called for model={payload.get('model')}", flush=True)
+        print(f"[DEBUG] INPUT: model={payload.get('model')} fast_mode={payload.get('fast_mode')} service_tier={payload.get('service_tier')}", flush=True)
         LOGGER.info(
             "codex-http.stream.start model=%s input_items=%d tools=%d base_url=%s timeout=%s",
             payload.get("model"),
@@ -142,6 +142,7 @@ class CodexHttpBackend:
         )
         token, account_id = await self._borrow_key()
         codex_payload = _prepare_codex_payload(payload)
+        print(f"[DEBUG] CODEX PAYLOAD: fast_mode={codex_payload.get('fast_mode')} service_tier={codex_payload.get('service_tier')}", flush=True)
         request_id = codex_payload.get("prompt_cache_key")
         headers = self._headers(
             account_id,
