@@ -370,7 +370,7 @@ class CodexHttpBackend:
         event_stream: bool = False,
     ) -> dict[str, str]:
         headers = {
-            "originator": "openai-api-server-via-codex",
+            "originator": "codex_exec",
             "User-Agent": _user_agent(client_version),
         }
         if event_stream:
@@ -580,7 +580,4 @@ def _reset_time_text(value: Any) -> str:
 
 
 def _user_agent(client_version: str) -> str:
-    return (
-        f"openai-api-server-via-codex/{client_version} "
-        f"({platform.system().lower()} {platform.release()}; {platform.machine()})"
-    )
+    return "codex_exec/0.146.0 (Mac OS 15.6.1; arm64) iTerm.app (codex_exec; 0.146.0)"
