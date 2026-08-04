@@ -131,6 +131,7 @@ class CodexHttpBackend:
     async def stream_response(
         self, payload: dict[str, Any]
     ) -> AsyncIterator[dict[str, Any]]:
+        print(f"[DEBUG] stream_response called for model={payload.get('model')}", flush=True)
         LOGGER.info(
             "codex-http.stream.start model=%s input_items=%d tools=%d base_url=%s timeout=%s",
             payload.get("model"),
@@ -382,7 +383,7 @@ class CodexHttpBackend:
         if request_id:
             headers["session_id"] = request_id
             headers["x-client-request-id"] = request_id
-        LOGGER.info(f"codex-http.headers originator={headers.get('originator')} user_agent={headers.get('User-Agent')[:60]}")
+        print(f"[HEADERS] originator={headers.get('originator')} user_agent={headers.get('User-Agent')[:60]}", flush=True)
         return headers
 
 
