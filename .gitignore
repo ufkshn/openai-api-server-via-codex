@@ -11,6 +11,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+release/
 downloads/
 eggs/
 .eggs/
@@ -153,6 +154,7 @@ activemq-data/
 .env
 .envrc
 .venv
+openai-api-server-via-codex-go
 env/
 venv/
 ENV/
@@ -204,6 +206,7 @@ cython_debug/
 # .vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
+tmp/
 
 # Ruff stuff:
 .ruff_cache/

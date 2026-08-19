@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900" viewBox="0 0 1400 900" role="img" aria-labelledby="title desc">
+  <title id="title">OpenAI API Server via Codex</title>
+  <desc id="desc">A macOS terminal showing the Go server starting with uvx, followed by an OpenAI-compatible Responses API request and successful response.</desc>
+
+  <defs>
+    <linearGradient id="titlebar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2d2938"/>
+      <stop offset="1" stop-color="#252130"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1400" height="900" rx="24" fill="#100e16"/>
+  <path d="M24 0h1352a24 24 0 0 1 24 24v44H0V24A24 24 0 0 1 24 0z" fill="url(#titlebar)"/>
+  <circle cx="38" cy="34" r="8.5" fill="#ff5f57"/>
+  <circle cx="67" cy="34" r="8.5" fill="#febc2e"/>
+  <circle cx="96" cy="34" r="8.5" fill="#28c840"/>
+  <text x="700" y="42" text-anchor="middle" fill="#c3bacd" font-family="Menlo, Monaco, Consolas, monospace" font-size="18">openai-api-server-via-codex</text>
+
+  <g font-family="Menlo, Monaco, Consolas, monospace" font-size="30" font-weight="400">
+    <text x="48" y="117" fill="#8f849d" font-size="20">SERVER</text>
+
+    <text x="48" y="166" fill="#72e6a6">$</text>
+    <text x="82" y="166" fill="#f7f3fb">uvx openai-api-server-via-codex</text>
+
+    <text x="48" y="218" fill="#c3bacd">openai-api-server-via-codex 0.2.0 (Go)</text>
+    <text x="48" y="262" fill="#72e6a6">listening on http://127.0.0.1:18080</text>
+
+    <rect x="48" y="309" width="516" height="58" rx="11" fill="#191620" stroke="#332e3d"/>
+    <text x="70" y="346" fill="#c3bacd">POST /v1/responses</text>
+    <circle cx="429" cy="338" r="5" fill="#72e6a6"/>
+    <text x="446" y="346" fill="#72e6a6" font-weight="700">200 OK</text>
+
+    <line x1="0" y1="414" x2="1400" y2="414" stroke="#40394a" stroke-width="2"/>
+
+    <text x="48" y="471" fill="#8f849d" font-size="20">CLIENT</text>
+
+    <text x="48" y="520" fill="#72e6a6">$</text>
+    <text x="82" y="520" fill="#f7f3fb">curl -s http://127.0.0.1:18080/v1/responses &#92;</text>
+
+    <text x="82" y="568" fill="#eedf70">-H 'Content-Type: application/json' &#92;</text>
+
+    <text x="82" y="616" fill="#eedf70">-d '{"model":"gpt-5.6-luna","input":"Say hello from Codex."}' &#92;</text>
+    <text x="82" y="664" fill="#eedf70">| jq -r '.output[0].content[0].text'</text>
+
+    <rect x="48" y="708" width="1304" height="104" rx="12" fill="#191620" stroke="#332e3d"/>
+    <text x="72" y="771" fill="#72e6a6">Hello from Codex!</text>
+  </g>
+</svg>
