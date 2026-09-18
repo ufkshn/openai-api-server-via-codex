@@ -819,3 +819,24 @@ func TestGoHTTPContractImageStreamValidationStaysHTTPError(t *testing.T) {
 		t.Fatalf("error = %#v", document)
 	}
 }
+
+// Which chat model drives the image tool is the only image-side choice Codex honours, so it has
+// to survive the whole /v1/images/generations handler — not just the helper that picks it.
+func TestContractImageGenerationForwardsTheDriverModel(t *testing.T) {
+	for _, tc := range []struct{ name, sent, want string }{
+		{"chat model is forwarded", "gpt-6-astra", "gpt-6-astra"},
+		{"image model falls back to the default", "gpt-image-2", defaultConfig().Model},
+		{"unreleased image model falls back too", "gpt-image-2.5", defaultConfig().Model},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			environment := newContractEnvironment(t, nil)
+			environment.json(t, http.MethodPost, "/v1/images/generations", map[string]any{
+				"model": tc.sent, "prompt": "a red cube", "n": 1,
+			}, http.StatusOK)
+			got := stringValue(environment.upstream.LastResponseRequest(t).JSON["model"])
+			if got != tc.want {
+				t.Fatalf("sent model %q: upstream received %q, want %q", tc.sent, got, tc.want)
+			}
+		})
+	}
+}

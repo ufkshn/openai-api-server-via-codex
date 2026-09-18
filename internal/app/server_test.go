@@ -562,3 +562,43 @@ func TestCompatibilityRoutesDoNotCaptureUnknownProxyEndpoints(t *testing.T) {
 		t.Fatal("chat messages route not recognized")
 	}
 }
+
+// Which chat model drives the image tool is the only image-side choice Codex honours, and an
+// image model name in that field is a 400 upstream — so it must fall back, not be forwarded.
+func TestImageDriverModelForwardsChatModelsAndFallsBackForImageNames(t *testing.T) {
+	for _, tc := range []struct{ model, want string }{
+		{"gpt-6-astra", "gpt-6-astra"},
+		{"gpt-5.6-sol", "gpt-5.6-sol"},
+		{"  gpt-5.6-luna  ", "gpt-5.6-luna"},
+		{"gpt-image-2", "default-model"},
+		{"gpt-image-2.5", "default-model"},
+		{"GPT-Image-2", "default-model"},
+		{"dall-e-3", "default-model"},
+		{"", "default-model"},
+	} {
+		if got := imageDriverModel(map[string]any{"model": tc.model}, "default-model"); got != tc.want {
+			t.Fatalf("imageDriverModel(%q) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+	if got := imageDriverModel(map[string]any{}, "default-model"); got != "default-model" {
+		t.Fatalf("missing model: got %q", got)
+	}
+}
+
+// The driver model must reach the payload the backend actually sends.
+func TestImageRequestSendsTheDriverModelUpstream(t *testing.T) {
+	payload := imageResponsePayload(
+		map[string]any{"model": "gpt-6-astra", "prompt": "a cube"},
+		imageDriverModel(map[string]any{"model": "gpt-6-astra"}, "gpt-5.6-luna"),
+	)
+	if payload["model"] != "gpt-6-astra" {
+		t.Fatalf("payload model = %v, want gpt-6-astra", payload["model"])
+	}
+	legacy := imageResponsePayload(
+		map[string]any{"model": "gpt-image-2", "prompt": "a cube"},
+		imageDriverModel(map[string]any{"model": "gpt-image-2"}, "gpt-5.6-luna"),
+	)
+	if legacy["model"] != "gpt-5.6-luna" {
+		t.Fatalf("legacy payload model = %v, want the configured default", legacy["model"])
+	}
+}

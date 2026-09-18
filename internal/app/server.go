@@ -889,7 +889,7 @@ func (s *server) images(w http.ResponseWriter, r *http.Request, edit bool) {
 	data := make([]any, 0, count)
 	created := int(time.Now().Unix())
 	for i := 0; i < count; i++ {
-		payload := imageResponsePayload(body, s.cfg.Model)
+		payload := imageResponsePayload(body, imageDriverModel(body, s.cfg.Model))
 		resp, err := s.backend.collect(r.Context(), payload)
 		if err != nil {
 			writeBackendError(w, err)
@@ -943,7 +943,7 @@ func (s *server) streamImages(w http.ResponseWriter, r *http.Request, body map[s
 		writeSSE(w, event)
 		flusher.Flush()
 	}
-	err := s.backend.stream(r.Context(), imageResponsePayload(body, s.cfg.Model), func(event map[string]any) error {
+	err := s.backend.stream(r.Context(), imageResponsePayload(body, imageDriverModel(body, s.cfg.Model)), func(event map[string]any) error {
 		switch stringValue(event["type"]) {
 		case "response.image_generation_call.partial_image":
 			partial := imageStreamEvent(prefix+".partial_image", metadata, created, stringValue(event["partial_image_b64"]), event)
@@ -1437,6 +1437,31 @@ func exactInt(value any) (int, bool) {
 // imageResponsePayload translates a public image request into a Codex Responses
 // call driven by the hosted image_generation tool. Supplying input images switches
 // the tool to action "edit"; Codex edits whatever images the conversation carries.
+// imageDriverModel picks the model that drives Codex's image_generation tool.
+//
+// Codex pins the image model itself — send tools[0].model as "gpt-image-2.5", a chat model name,
+// or pure nonsense and it echoes back "gpt-image-2-codex" every time, without an error. The one
+// thing a caller can still choose is which CHAT model runs the tool, and that does change the
+// result: the same prompt through gpt-5.6-luna and gpt-6-astra yields different compositions,
+// because each writes its own revised_prompt.
+//
+// The caller's `model` is therefore forwarded — except when it names an image model. OpenAI's
+// image API takes "gpt-image-2"/"dall-e-3" there, so every existing client sends one, and Codex
+// answers a chat request carrying that model with a bare 400. Those keep the configured default,
+// which is what they already got before this existed.
+func imageDriverModel(body map[string]any, fallback string) string {
+	model := strings.TrimSpace(stringValue(body["model"]))
+	if model == "" || isImageModelName(model) {
+		return fallback
+	}
+	return model
+}
+
+func isImageModelName(model string) bool {
+	lower := strings.ToLower(model)
+	return strings.HasPrefix(lower, "gpt-image") || strings.HasPrefix(lower, "dall-e")
+}
+
 func imageResponsePayload(body map[string]any, model string) map[string]any {
 	format := stringValue(body["output_format"])
 	if format == "" {
