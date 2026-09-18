@@ -40,7 +40,11 @@ func (b *backend) dialWebSocket(ctx context.Context, incoming http.Header, query
 		headers := b.headers(cred, true, incoming.Get("x-client-request-id"))
 		headers.Del("Accept")
 		headers.Del("Content-Type")
-		for _, key := range []string{"OpenAI-Beta", "session_id", "x-client-request-id", "x-codex-turn-state", "x-codex-turn-metadata"} {
+		// X-Fast-Mode is connection-scoped here, unlike the HTTP path where it is
+		// popped from each request body. A WebSocket dials once and its headers are
+		// fixed at the handshake, so a per-event body field could never reach Codex
+		// as the header it only honours as a header.
+		for _, key := range []string{"OpenAI-Beta", "session_id", "x-client-request-id", "x-codex-turn-state", "x-codex-turn-metadata", "X-Fast-Mode"} {
 			if value := incoming.Get(key); value != "" {
 				headers.Set(key, value)
 			}
@@ -203,6 +207,20 @@ func (s *server) relayWebSocket(ctx context.Context, from, to *websocket.Conn, c
 		if client && kind == websocket.MessageText {
 			event := decodeWebSocketEvent(data)
 			if event != nil && event["type"] == "response.create" {
+				if boolValue(event["fast_mode"]) {
+					rejected := map[string]any{"type": "error", "status": 400, "error": map[string]any{"type": "invalid_request_error", "code": "unsupported_parameter", "param": "fast_mode", "message": fastModeBodyUnsupportedMessage}}
+					for _, key := range []string{"event_id", "stream_id"} {
+						if event[key] != nil {
+							rejected[key] = event[key]
+						}
+					}
+					encoded, _ := json.Marshal(rejected)
+					encoded = redactWebSocketError(encoded, s.cfg.APIKey, token)
+					if err := s.writeWebSocket(ctx, from, websocket.MessageText, encoded); err != nil {
+						return err
+					}
+					continue
+				}
 				if boolValue(event["background"]) {
 					rejected := map[string]any{"type": "error", "status": 400, "error": map[string]any{"type": "invalid_request_error", "code": "unsupported_parameter", "param": "background", "message": backgroundUnsupportedMessage}}
 					for _, key := range []string{"event_id", "stream_id"} {
@@ -370,6 +388,11 @@ func (s *server) abortWebSockets() {
 		lifecycle.abort()
 	}
 }
+
+// Refusing beats forwarding: Codex ignores fast_mode in the body, so a silently
+// forwarded field would leave the caller believing fast mode is on while every
+// response is served at normal speed.
+const fastModeBodyUnsupportedMessage = "Codex honours fast mode only as a header, and a WebSocket fixes its headers at the handshake. Send X-Fast-Mode: true on the upgrade request to enable it for the whole connection."
 
 const backgroundUnsupportedMessage = "Codex does not support background responses. Use foreground HTTP streaming or WebSocket mode."
 

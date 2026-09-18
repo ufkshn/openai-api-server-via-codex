@@ -531,3 +531,63 @@ func TestShutdownDeadlineIncludesUnresponsiveWebSocket(t *testing.T) {
 		})
 	}
 }
+
+// Fast mode is connection-scoped on this transport: the header must reach Codex
+// at the handshake, and an in-body fast_mode must be refused rather than
+// forwarded as a field Codex ignores.
+func TestWebSocketFastModeTravelsAsHandshakeHeaderAndRejectsBodyField(t *testing.T) {
+	var upstreamFastMode atomic.Value
+	var calls atomic.Int32
+	_, target := websocketTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamFastMode.Store(r.Header.Get("X-Fast-Mode"))
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			var v map[string]any
+			if wsjson.Read(context.Background(), conn, &v) != nil {
+				return
+			}
+			calls.Add(1)
+			if wsjson.Write(context.Background(), conn, v) != nil {
+				return
+			}
+		}
+	}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, target, &websocket.DialOptions{HTTPHeader: http.Header{
+		"Authorization": {"Bearer " + contractAPIKey},
+		"X-Fast-Mode":   {"true"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+
+	if got := upstreamFastMode.Load(); got != "true" {
+		t.Fatalf("X-Fast-Mode did not reach Codex at the handshake: %#v", got)
+	}
+
+	for _, fastMode := range []bool{true, false} {
+		if err := wsjson.Write(ctx, conn, map[string]any{"type": "response.create", "fast_mode": fastMode, "input": "hello", "stream_id": "lane"}); err != nil {
+			t.Fatal(err)
+		}
+		var event map[string]any
+		if err := wsjson.Read(ctx, conn, &event); err != nil {
+			t.Fatal(err)
+		}
+		if fastMode && (mapAny(event["error"])["code"] != "unsupported_parameter" || mapAny(event["error"])["param"] != "fast_mode" || event["stream_id"] != "lane") {
+			t.Fatalf("in-body fast_mode was not refused: %#v", event)
+		}
+		if !fastMode && event["type"] != "response.create" {
+			t.Fatalf("connection did not recover: %#v", event)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatal("in-body fast_mode forwarded upstream")
+	}
+}

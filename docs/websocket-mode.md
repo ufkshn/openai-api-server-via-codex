@@ -177,6 +177,22 @@ seconds and bounds each Pong wait by the timeout setting. This detects dead peer
 and provides transport keepalive; upstream session expiration still applies.
 Apply response deadlines in the consumer.
 
+## Fast mode
+
+Fast mode is connection-scoped on this transport. Send `X-Fast-Mode: true` on the
+upgrade request and every response on that connection is served with it; open a
+second connection for normal-speed traffic.
+
+It cannot be set per response, because Codex honours fast mode only as a request
+header and a WebSocket fixes its headers at the handshake. A `fast_mode` field on
+a `response.create` event is therefore refused with a `400
+unsupported_parameter` error event, without closing the connection — the same
+treatment `background` receives. Forwarding it instead would leave the caller
+believing fast mode is on while Codex quietly ignores the field.
+
+This differs from the HTTP path, where `fast_mode` is read from each request body
+and moved into the header per request.
+
 The incoming API key is checked before connecting upstream and is never used as
 Codex authentication. An upstream handshake `401` causes one auth-file reload and
 one retry, before the client is upgraded. Errors after upgrade are not retried.
