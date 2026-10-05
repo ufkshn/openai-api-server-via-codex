@@ -617,6 +617,10 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 		writeBackendError(w, err)
 		return
 	}
+	if stringValue(response["status"]) == "failed" {
+		writeBackendError(w, failureFromDetail(mapOrEmpty(response["error"])))
+		return
+	}
 	response = ensureResponse(response, responsePayload)
 	completion := responseToChat(response, stringValue(responsePayload["model"]), legacy, chatChoiceCount(body["n"]))
 	if metadata := mapAny(body["metadata"]); metadata != nil {
@@ -642,6 +646,7 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 	includeUsage := boolValue(mapAny(body["stream_options"])["include_usage"])
 	var outputs []any
 	emitted := map[int]string{}
+	var failure *upstreamFailure
 	emit := func(v map[string]any) { writeSSE(w, v); flusher.Flush() }
 	role := func() {
 		if !state.RoleSent {
@@ -650,6 +655,12 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 		}
 	}
 	err := s.backend.stream(r.Context(), responsePayload, func(event map[string]any) error {
+		if failure != nil {
+			return nil
+		}
+		if failure = failureFromEvent(event); failure != nil {
+			return nil
+		}
 		typ := stringValue(event["type"])
 		switch typ {
 		case "response.created":
@@ -702,7 +713,7 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 					}
 				}
 			}
-		case "response.completed", "response.incomplete", "response.failed":
+		case "response.completed", "response.incomplete":
 			resp := mapAny(event["response"])
 			if resp != nil {
 				if len(sliceAny(resp["output"])) == 0 && len(outputs) > 0 {
@@ -728,11 +739,68 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 		}
 		return nil
 	})
-	if err != nil {
+	if failure != nil {
+		emit(map[string]any{"error": failure.body()})
+	} else if err != nil {
 		emit(map[string]any{"error": map[string]any{"message": publicStreamError(err), "type": "api_error", "param": nil, "code": nil}})
 	}
 	io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// upstreamFailure is a Codex `error` event or failed response, shaped as the OpenAI error a Chat
+// Completions client can act on. Chat has no failed completion: before this, an upstream
+// failure such as server_is_overloaded reached clients as an empty `finish_reason: "stop"`
+// with zero usage, indistinguishable from a model that chose to say nothing.
+type upstreamFailure struct {
+	Status        int
+	Message, Type string
+	Code          string
+}
+
+func (e *upstreamFailure) Error() string { return e.Message }
+
+func (e *upstreamFailure) body() map[string]any {
+	var code any
+	if e.Code != "" {
+		code = e.Code
+	}
+	return map[string]any{"message": e.Message, "type": e.Type, "param": nil, "code": code}
+}
+
+func failureFromEvent(event map[string]any) *upstreamFailure {
+	var detail map[string]any
+	switch stringValue(event["type"]) {
+	case "error":
+		if detail = mapAny(event["error"]); detail == nil {
+			detail = event
+		}
+	case "response.failed":
+		detail = mapAny(mapAny(event["response"])["error"])
+	default:
+		return nil
+	}
+	return failureFromDetail(detail)
+}
+
+func failureFromDetail(detail map[string]any) *upstreamFailure {
+	code := stringValue(detail["code"])
+	message := stringValue(detail["message"])
+	if message == "" {
+		message = "Codex backend response failed."
+	}
+	status := http.StatusBadGateway
+	switch code {
+	case "server_is_overloaded", "slow_down":
+		status = http.StatusServiceUnavailable
+	case "rate_limit_exceeded", "usage_limit_reached", "usage_not_included":
+		status = http.StatusTooManyRequests
+	}
+	typ := stringValue(detail["type"])
+	if typ == "" || typ == "error" {
+		typ = "api_error"
+	}
+	return &upstreamFailure{Status: status, Message: redactSensitive(message), Type: typ, Code: code}
 }
 
 type chatStreamState struct {
@@ -1082,6 +1150,11 @@ func writeError(w http.ResponseWriter, status int, message, typ string, param *s
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": typ, "param": p, "code": code}})
 }
 func writeBackendError(w http.ResponseWriter, err error) {
+	var failure *upstreamFailure
+	if errors.As(err, &failure) {
+		writeJSON(w, failure.Status, map[string]any{"error": failure.body()})
+		return
+	}
 	var be *backendError
 	if errors.As(err, &be) {
 		writeError(w, be.Status, be.Message, "api_error", nil, nil)
@@ -1090,6 +1163,10 @@ func writeBackendError(w http.ResponseWriter, err error) {
 	}
 }
 func publicStreamError(err error) string {
+	var failure *upstreamFailure
+	if errors.As(err, &failure) {
+		return failure.Message
+	}
 	var be *backendError
 	if errors.As(err, &be) {
 		return be.Message

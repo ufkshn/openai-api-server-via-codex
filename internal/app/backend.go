@@ -300,8 +300,11 @@ func (b *backend) collect(ctx context.Context, payload map[string]any) (map[stri
 	var output []any
 	var text strings.Builder
 	var responseID string
+	var upstreamErr *upstreamFailure
 	err := b.stream(ctx, payload, func(event map[string]any) error {
 		switch event["type"] {
+		case "error":
+			upstreamErr = failureFromEvent(event)
 		case "response.created":
 			if r := mapAny(event["response"]); r != nil {
 				responseID = stringValue(r["id"])
@@ -324,6 +327,10 @@ func (b *backend) collect(ctx context.Context, payload map[string]any) (map[stri
 	})
 	if err != nil {
 		return nil, err
+	}
+	if completed == nil && upstreamErr != nil {
+		// Without a terminal response the text fallback below would report an empty success.
+		return nil, upstreamErr
 	}
 	if completed != nil {
 		if len(sliceAny(completed["output"])) == 0 && len(output) > 0 {

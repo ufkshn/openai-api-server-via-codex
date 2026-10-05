@@ -590,6 +590,15 @@ low text verbosity by default, Codex-compatible tool defaults, and encrypted
 reasoning content. Public storage compatibility is implemented in the server's
 bounded in-memory stores.
 
+Upstream failures stay failures. Responses keeps them as they are: streaming
+forwards `error` and `response.failed`, and non-streaming returns the response
+with `status: "failed"` and its `error`. Chat Completions cannot represent a
+failed completion. A streamed chat therefore ends with an OpenAI `error` chunk
+in place of a finish/usage chunk, and a non-streamed chat returns an HTTP error.
+Codex `server_is_overloaded` maps to `503` and Codex rate/usage limits map to
+`429`; any other failure maps to `502`. The upstream `code` is kept, so
+`openai-python` raises instead of returning an empty answer.
+
 Model listing is best-effort. A model can sometimes accept direct requests even
 when it is absent from the upstream catalog returned by `/v1/models`.
 

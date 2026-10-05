@@ -178,6 +178,21 @@ func (s *Server) responses(w http.ResponseWriter, payload map[string]any) {
 		<-gate
 	}
 
+	if strings.Contains(text, "FAKE_OVERLOADED") || strings.Contains(text, "FAKE_ERROR_ONLY") {
+		// The sequence Codex sent on 2026-10-05 while gpt-6-sol was overloaded.
+		detail := map[string]any{
+			"type": "service_unavailable_error", "code": "server_is_overloaded", "param": nil,
+			"message": "Our servers are currently overloaded. Please try again later.",
+		}
+		writeSSE(w, map[string]any{"type": "error", "sequence_number": 2, "error": detail})
+		if strings.Contains(text, "FAKE_OVERLOADED") {
+			failed := clone(created)
+			failed["status"] = "failed"
+			failed["error"] = map[string]any{"code": detail["code"], "message": detail["message"]}
+			writeSSE(w, map[string]any{"type": "response.failed", "sequence_number": 3, "response": failed})
+		}
+		return
+	}
 	if strings.Contains(text, "FAKE_UPSTREAM_ERROR") {
 		return
 	}

@@ -477,6 +477,82 @@ func TestGoHTTPContractCollectFallbackFailureAndNormalization(t *testing.T) {
 	}
 }
 
+func TestGoHTTPContractChatSurfacesUpstreamFailure(t *testing.T) {
+	environment := newContractEnvironment(t, nil)
+	chat := func(text string, stream bool) map[string]any {
+		return map[string]any{
+			"model": "gpt-6-sol", "stream": stream, "stream_options": map[string]any{"include_usage": true},
+			"messages": []any{map[string]any{"role": "user", "content": text}},
+		}
+	}
+	for _, trigger := range []string{"FAKE_OVERLOADED", "FAKE_ERROR_ONLY"} {
+		// Streaming: an error chunk, and no stop/usage chunk that reads as an empty success.
+		response, data := environment.request(t, http.MethodPost, "/v1/chat/completions", chat(trigger, true))
+		if response.StatusCode != http.StatusOK || !strings.HasSuffix(strings.TrimSpace(string(data)), "data: [DONE]") {
+			t.Fatalf("%s stream = %d %s", trigger, response.StatusCode, data)
+		}
+		var failure map[string]any
+		for _, event := range parseSSE(t, data) {
+			if event["usage"] != nil {
+				t.Fatalf("%s stream reported usage: %s", trigger, data)
+			}
+			for _, choice := range sliceAny(event["choices"]) {
+				if mapAny(choice)["finish_reason"] != nil {
+					t.Fatalf("%s stream finished as a completion: %s", trigger, data)
+				}
+			}
+			if e := mapAny(event["error"]); e != nil {
+				failure = e
+			}
+		}
+		if failure["code"] != "server_is_overloaded" || failure["type"] != "service_unavailable_error" ||
+			!strings.Contains(stringValue(failure["message"]), "overloaded") {
+			t.Fatalf("%s stream error = %#v; body=%s", trigger, failure, data)
+		}
+		// Non-streaming: the HTTP status says what happened.
+		document := environment.json(t, http.MethodPost, "/v1/chat/completions", chat(trigger, false), http.StatusServiceUnavailable)
+		if e := mapAny(document["error"]); e["code"] != "server_is_overloaded" {
+			t.Fatalf("%s error = %#v", trigger, document)
+		}
+	}
+	// A failed response without error detail still fails rather than completing empty.
+	_, data := environment.request(t, http.MethodPost, "/v1/chat/completions", chat("FAKE_RESPONSE_FAILED", true))
+	events := parseSSE(t, data)
+	if e := mapAny(events[len(events)-1]["error"]); e == nil || e["type"] != "api_error" {
+		t.Fatalf("failed stream = %s", data)
+	}
+	environment.json(t, http.MethodPost, "/v1/chat/completions", chat("FAKE_RESPONSE_FAILED", false), http.StatusBadGateway)
+}
+
+func TestGoHTTPContractResponsesKeepsFailedStatusButNeverInventsSuccess(t *testing.T) {
+	environment := newContractEnvironment(t, nil)
+	// Responses can represent failure: the failed response, with its error, is the answer.
+	failed := environment.json(t, http.MethodPost, "/v1/responses", map[string]any{
+		"model": "gpt-6-sol", "input": "FAKE_OVERLOADED",
+	}, http.StatusOK)
+	if failed["status"] != "failed" || mapAny(failed["error"])["code"] != "server_is_overloaded" {
+		t.Fatalf("failed response = %#v", failed)
+	}
+	// An error event with no terminal response used to become an empty "completed" response.
+	document := environment.json(t, http.MethodPost, "/v1/responses", map[string]any{
+		"model": "gpt-6-sol", "input": "FAKE_ERROR_ONLY",
+	}, http.StatusServiceUnavailable)
+	if mapAny(document["error"])["code"] != "server_is_overloaded" {
+		t.Fatalf("error-only response = %#v", document)
+	}
+	// Streaming Responses already forwards both upstream events unchanged.
+	_, data := environment.request(t, http.MethodPost, "/v1/responses", map[string]any{
+		"model": "gpt-6-sol", "input": "FAKE_OVERLOADED", "stream": true,
+	})
+	var types []string
+	for _, event := range parseSSE(t, data) {
+		types = append(types, stringValue(event["type"]))
+	}
+	if !strings.Contains(strings.Join(types, ","), "error,response.failed") {
+		t.Fatalf("responses stream types = %v", types)
+	}
+}
+
 func TestGoHTTPContractConcurrencySlotCoversStreamingLifetime(t *testing.T) {
 	environment := newContractEnvironment(t, func(cfg *config) { cfg.Concurrency = 1 })
 	gate := make(chan struct{})

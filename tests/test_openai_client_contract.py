@@ -14,7 +14,13 @@ from typing import Any, cast
 
 import httpx
 import pytest
-from openai import AsyncOpenAI, ConflictError, NotFoundError
+from openai import (
+    APIError,
+    AsyncOpenAI,
+    ConflictError,
+    InternalServerError,
+    NotFoundError,
+)
 
 
 def _free_port() -> int:
@@ -215,21 +221,42 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
                     "logprobs": [],
                 }
             )
-        events.extend(
-            [
+        if "FAKE_OVERLOADED" in _flatten_text(payload.get("input")):
+            # The sequence Codex sent on 2026-10-05 while gpt-6-sol was overloaded.
+            detail = {
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "param": None,
+                "message": "Our servers are currently overloaded. Please try again later.",
+            }
+            events = events[:1] + [
+                {"type": "error", "sequence_number": 1, "error": detail},
                 {
-                    "type": "response.output_item.done",
-                    "sequence_number": 3,
-                    "output_index": 0,
-                    "item": item,
-                },
-                {
-                    "type": "response.completed",
-                    "sequence_number": 4,
-                    "response": response,
+                    "type": "response.failed",
+                    "sequence_number": 2,
+                    "response": {
+                        **created_response,
+                        "status": "failed",
+                        "error": {"code": detail["code"], "message": detail["message"]},
+                    },
                 },
             ]
-        )
+        else:
+            events.extend(
+                [
+                    {
+                        "type": "response.output_item.done",
+                        "sequence_number": 3,
+                        "output_index": 0,
+                        "item": item,
+                    },
+                    {
+                        "type": "response.completed",
+                        "sequence_number": 4,
+                        "response": response,
+                    },
+                ]
+            )
         chunks = (
             "".join(
                 f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
@@ -679,6 +706,35 @@ async def test_contract_chat_lifecycle_streaming_and_tools(
     assert deleted.deleted is True, runtime
 
 
+async def test_contract_chat_raises_upstream_overload(
+    contract_client: AsyncOpenAI,
+) -> None:
+    """An upstream failure must raise in the SDK, not arrive as an empty completion."""
+    messages: Any = [{"role": "user", "content": "FAKE_OVERLOADED"}]
+    with pytest.raises(InternalServerError) as raised:
+        await contract_client.chat.completions.create(
+            model="gpt-6-sol", messages=messages
+        )
+    assert raised.value.status_code == 503
+    assert raised.value.code == "server_is_overloaded"
+
+    stream = await contract_client.chat.completions.create(
+        model="gpt-6-sol",
+        messages=messages,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    chunks = []
+    with pytest.raises(APIError) as streamed:
+        async for chunk in stream:
+            chunks.append(chunk)
+    assert "overloaded" in streamed.value.message
+    assert all(
+        choice.finish_reason is None for chunk in chunks for choice in chunk.choices
+    )
+    assert all(chunk.usage is None for chunk in chunks)
+
+
 async def test_contract_images_audio_and_unknown_proxy(
     runtime_server: tuple[str, str], contract_client: AsyncOpenAI
 ) -> None:
@@ -790,6 +846,8 @@ async def test_contract_image_edit_streaming_through_sdk(
     async for event in stream:
         seen.append(event.type)
     assert seen == ["image_edit.partial_image", "image_edit.completed"], runtime
+
+
 @pytest.fixture
 def websocket_runtime(
     go_binary: Path,
