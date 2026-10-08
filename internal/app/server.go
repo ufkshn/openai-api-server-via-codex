@@ -648,6 +648,25 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 	emitted := map[int]string{}
 	var failure *upstreamFailure
 	emit := func(v map[string]any) { writeSSE(w, v); flusher.Flush() }
+	emitArguments := func(idx int, delta string) {
+		emitted[idx] += delta
+		var d map[string]any
+		if legacy {
+			d = map[string]any{"function_call": map[string]any{"arguments": delta}}
+		} else {
+			d = map[string]any{"tool_calls": []any{map[string]any{"index": idx, "function": map[string]any{"arguments": delta}}}}
+		}
+		emit(chatChunk(state, d, nil, nil, nil))
+	}
+	// emittedRest is the part of a call's final arguments not yet streamed as deltas. A
+	// final value that does not extend what was streamed cannot be corrected and is left alone.
+	emittedRest := func(idx int, final string) string {
+		sent := emitted[idx]
+		if len(final) <= len(sent) || !strings.HasPrefix(final, sent) {
+			return ""
+		}
+		return final[len(sent):]
+	}
 	role := func() {
 		if !state.RoleSent {
 			state.RoleSent = true
@@ -685,15 +704,14 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 		case "response.function_call_arguments.delta":
 			role()
 			idx := intValue(event["output_index"])
-			delta := stringValue(event["delta"])
-			emitted[idx] += delta
-			var d map[string]any
-			if legacy {
-				d = map[string]any{"function_call": map[string]any{"arguments": delta}}
-			} else {
-				d = map[string]any{"tool_calls": []any{map[string]any{"index": idx, "function": map[string]any{"arguments": delta}}}}
+			emitArguments(idx, stringValue(event["delta"]))
+		case "response.function_call_arguments.done":
+			// Codex may send no deltas at all and deliver the arguments only here.
+			idx := intValue(event["output_index"])
+			if rest := emittedRest(idx, stringValue(event["arguments"])); rest != "" {
+				role()
+				emitArguments(idx, rest)
 			}
-			emit(chatChunk(state, d, nil, nil, nil))
 		case "response.output_item.done":
 			item := mapAny(event["item"])
 			if item != nil {
@@ -704,6 +722,8 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 						role()
 						emitted[idx] = stringValue(item["arguments"])
 						emit(chatChunk(state, toolDelta(item, idx, emitted[idx], true, legacy), nil, nil, nil))
+					} else if rest := emittedRest(idx, stringValue(item["arguments"])); rest != "" {
+						emitArguments(idx, rest)
 					}
 				} else if item["type"] == "message" && !state.SawText {
 					if text := messageText(item); text != "" {

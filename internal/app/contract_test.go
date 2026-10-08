@@ -524,6 +524,33 @@ func TestGoHTTPContractChatSurfacesUpstreamFailure(t *testing.T) {
 	environment.json(t, http.MethodPost, "/v1/chat/completions", chat("FAKE_RESPONSE_FAILED", false), http.StatusBadGateway)
 }
 
+func TestGoHTTPContractChatStreamsToolArgumentsSentWithoutDeltas(t *testing.T) {
+	environment := newContractEnvironment(t, nil)
+	for _, trigger := range []string{"FAKE_ARGS_DONE_ONLY", "streamed deltas"} {
+		_, data := environment.request(t, http.MethodPost, "/v1/chat/completions", map[string]any{
+			"model": "gpt-6-sol", "stream": true,
+			"messages": []any{map[string]any{"role": "user", "content": trigger}},
+			"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+				"name": "lookup_weather", "parameters": map[string]any{"type": "object"},
+			}}},
+		})
+		name, arguments := "", ""
+		for _, event := range parseSSE(t, data) {
+			for _, choice := range sliceAny(event["choices"]) {
+				for _, call := range sliceAny(mapAny(mapAny(choice)["delta"])["tool_calls"]) {
+					fn := mapAny(mapAny(call)["function"])
+					name += stringValue(fn["name"])
+					arguments += stringValue(fn["arguments"])
+				}
+			}
+		}
+		// Exactly once: neither lost nor repeated by the done events.
+		if name != "lookup_weather" || arguments != `{"city":"Tokyo"}` {
+			t.Fatalf("%s: tool call = %q %q; body=%s", trigger, name, arguments, data)
+		}
+	}
+}
+
 func TestGoHTTPContractResponsesKeepsFailedStatusButNeverInventsSuccess(t *testing.T) {
 	environment := newContractEnvironment(t, nil)
 	// Responses can represent failure: the failed response, with its error, is the answer.

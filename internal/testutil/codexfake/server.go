@@ -228,7 +228,13 @@ func (s *Server) responses(w http.ResponseWriter, payload map[string]any) {
 		added["arguments"] = ""
 		added["status"] = "in_progress"
 		writeSSE(w, map[string]any{"type": "response.output_item.added", "sequence_number": 1, "output_index": 0, "item": added})
-		writeSSE(w, map[string]any{"type": "response.function_call_arguments.delta", "sequence_number": 2, "output_index": 0, "delta": `{"city":"Tokyo"}`})
+		if strings.Contains(text, "FAKE_ARGS_DONE_ONLY") {
+			// Since 2026-10-07 Codex often streams no argument deltas: the arguments
+			// arrive whole in function_call_arguments.done and output_item.done.
+			writeSSE(w, map[string]any{"type": "response.function_call_arguments.done", "sequence_number": 2, "output_index": 0, "item_id": item["id"], "arguments": `{"city":"Tokyo"}`})
+		} else {
+			writeSSE(w, map[string]any{"type": "response.function_call_arguments.delta", "sequence_number": 2, "output_index": 0, "delta": `{"city":"Tokyo"}`})
+		}
 	} else if item["type"] == "message" {
 		writeSSE(w, map[string]any{
 			"type": "response.output_text.delta", "sequence_number": 1,
