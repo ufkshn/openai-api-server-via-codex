@@ -309,6 +309,48 @@ $ openai-api-server-via-codex --auth-json /path/to/auth.json
 $ OPENAI_VIA_CODEX_AUTH_JSON=/path/to/auth.json openai-api-server-via-codex
 ```
 
+### Multiple accounts
+
+The proxy can hold several ChatGPT logins and spread requests across them.
+Clients see nothing of this: same base URL, same key, same responses.
+
+Accounts live next to the configured `auth.json`, so a single-account setup
+needs no change:
+
+| Path | Holds |
+| --- | --- |
+| `<auth dir>/auth.json` | account `default` — the original login |
+| `<auth dir>/accounts/<id>/auth.json` | one directory per added account |
+| `<auth dir>/accounts.json` | the accounts an operator disabled |
+
+Add, disable, enable and remove accounts from the [operator console](#operator-console).
+Dropping a login into `accounts/<id>/auth.json` by hand also works; it is
+picked up within ten seconds.
+
+Routing, per request:
+
+- The ready account with the fewest requests in flight wins. Ties go to the
+  account with the lower reported usage (the `x-codex-*-used-percent` headers
+  Codex returns), then to the one idle longest. A WebSocket counts as load on
+  its account for as long as it stays open.
+- A conversation stays on the account that produced its encrypted reasoning,
+  because only that account can decrypt it. If that account is unavailable,
+  the replayed reasoning is dropped and the request runs elsewhere. A request
+  with the same `prompt_cache_key` prefers the same account while it is not
+  noticeably busier, which keeps prompt caching effective.
+- An account that answers `429` cools down until the reset time Codex reports
+  (or for a short default), and one that still answers `401` after a credential
+  reload cools down for ten minutes. In both cases the request moves to the next
+  account before any byte reaches the client. When every account is cooling, the
+  one that recovers first is still tried, so a single-account proxy behaves as
+  it always did.
+- A disabled account receives no new requests; requests already running on it
+  finish. Disabling persists across restarts; a cooldown does not.
+
+Each login must exist in exactly one place. Refresh tokens rotate when used, so
+two processes refreshing copies of one login eventually invalidate both. The
+console refuses to add a login that is already in the pool.
+
 ### Protecting the local API
 
 Configure an incoming API key when other machines or untrusted processes can
@@ -335,8 +377,8 @@ bodies. `--verbose` adds deeper redacted diagnostics.
 
 ## Operator console
 
-A small web console at `/ui` for signing the server in to a ChatGPT account
-without shell access — the case that matters when it runs as an unattended
+A small web console at `/ui` for signing the server in to ChatGPT accounts and
+managing the [account pool](#multiple-accounts) without shell access — the case that matters when it runs as an unattended
 container on a shared host.
 
 It offers two paths:
@@ -349,8 +391,13 @@ It offers two paths:
   validated before it replaces anything, so a bad paste cannot destroy a working
   login.
 
-It also reports whether the credentials actually work (not merely that a file
-exists), the account, and the token expiry, and can sign out.
+Both paths add a new account by default; "Sign in again" on an account, or
+choosing it under "Save as", replaces that account's login instead.
+
+For every account it shows whether the credentials actually work (not merely
+that a file exists), the email and plan, requests in flight, the usage windows
+Codex reports, and any cooldown with its reason. Each account can be disabled,
+enabled or removed there.
 
 ### Access control
 

@@ -408,10 +408,11 @@ func TestWebSocketKeepAliveAndGracefulShutdown(t *testing.T) {
 	}, nil)
 	conn := dialTestWebSocket(t, target)
 	done := make(chan error, 1)
-	upstream, _, err := s.backend.(websocketBackend).dialWebSocket(context.Background(), nil, "")
+	upstream, _, release, err := s.backend.(websocketBackend).dialWebSocket(context.Background(), nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer release()
 	defer upstream.CloseNow()
 	readCtx, stopRead := context.WithCancel(context.Background())
 	defer stopRead()

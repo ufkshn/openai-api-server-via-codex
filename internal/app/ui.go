@@ -6,7 +6,8 @@ package app
 // normally means shell access to run `codex login`, which is exactly what an
 // unattended container on a shared host does not offer. The console closes that
 // gap with two paths — a device-code sign-in and a paste fallback — so the login
-// can be established and re-established from a browser.
+// can be established and re-established from a browser. With several accounts
+// in the pool it is also where they are added, disabled and removed.
 //
 // The device-code path drives the official Codex CLI rather than calling the
 // device-auth API directly. That API is undocumented (usercode + an unspecified
@@ -28,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -109,7 +111,11 @@ type deviceLogin struct {
 	URL      string
 	Message  string
 	Failed   bool
+	Account  string
 	started  time.Time
+	// onDone runs after the CLI exits successfully and decides the outcome:
+	// the login lands in a staging directory and only becomes an account here.
+	onDone func() (message string, failed bool)
 }
 
 func (d *deviceLogin) snapshot() map[string]any {
@@ -121,6 +127,7 @@ func (d *deviceLogin) snapshot() map[string]any {
 		"url":       d.URL,
 		"message":   d.Message,
 		"failed":    d.Failed,
+		"account":   d.Account,
 	}
 }
 
@@ -139,7 +146,7 @@ func (d *deviceLogin) cancel() {
 
 // start launches the CLI and streams its output into the shared state until it
 // exits. Returns an error only if the process could not be started at all.
-func (d *deviceLogin) start(codexPath, codexHome string) error {
+func (d *deviceLogin) start(codexPath, codexHome, account string, onDone func() (string, bool)) error {
 	d.mu.Lock()
 	if d.running {
 		d.mu.Unlock()
@@ -158,8 +165,8 @@ func (d *deviceLogin) start(codexPath, codexHome string) error {
 		d.mu.Unlock()
 		return err
 	}
-	d.cmd, d.running, d.started = cmd, true, time.Now()
-	d.UserCode, d.URL, d.Message, d.Failed = "", "", "Starting sign-in…", false
+	d.cmd, d.running, d.started, d.onDone = cmd, true, time.Now(), onDone
+	d.UserCode, d.URL, d.Message, d.Failed, d.Account = "", "", "Starting sign-in…", false, account
 	d.mu.Unlock()
 
 	go d.consume(cmd, pipe)
@@ -199,11 +206,22 @@ func (d *deviceLogin) consume(cmd *exec.Cmd, pipe io.ReadCloser) {
 	}
 	err := cmd.Wait()
 	d.mu.Lock()
+	failed, onDone := d.Failed, d.onDone
+	d.mu.Unlock()
+	message := ""
+	if err == nil && !failed && onDone != nil {
+		// Outside the lock: it writes files and reads the pool.
+		message, failed = onDone()
+	}
+	d.mu.Lock()
 	d.running = false
 	if err != nil && !d.Failed {
 		d.Failed, d.Message = true, "Sign-in did not complete: "+err.Error()
 	} else if err == nil && !d.Failed {
-		d.Message = "Signed in."
+		d.Failed, d.Message = failed, message
+		if d.Message == "" {
+			d.Message = "Signed in."
+		}
 	}
 	d.mu.Unlock()
 }
@@ -252,8 +270,12 @@ func (s *server) serveUI(w http.ResponseWriter, r *http.Request) {
 		s.uiGuard(w, r, s.uiSignInCancel)
 	case path == "api/auth/paste" && r.Method == http.MethodPost:
 		s.uiGuard(w, r, s.uiPasteAuth)
-	case path == "api/auth/delete" && r.Method == http.MethodPost:
-		s.uiGuard(w, r, s.uiDeleteAuth)
+	case path == "api/accounts/enable" && r.Method == http.MethodPost:
+		s.uiGuard(w, r, func(w http.ResponseWriter, r *http.Request) { s.uiSetEnabled(w, r, true) })
+	case path == "api/accounts/disable" && r.Method == http.MethodPost:
+		s.uiGuard(w, r, func(w http.ResponseWriter, r *http.Request) { s.uiSetEnabled(w, r, false) })
+	case path == "api/accounts/remove" && r.Method == http.MethodPost:
+		s.uiGuard(w, r, s.uiRemoveAccount)
 	default:
 		http.NotFound(w, r)
 	}
@@ -308,41 +330,22 @@ func (s *server) uiLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) uiStatus(w http.ResponseWriter, _ *http.Request) {
-	status := map[string]any{
-		"auth_path":     s.cfg.AuthJSON,
-		"default_model": s.cfg.Model,
-		"codex_cli":     s.codexCLIPath() != "",
-		"signin":        s.device.snapshot(),
-	}
-	if info, err := os.Stat(expandHome(s.cfg.AuthJSON)); err == nil {
-		status["auth_file_present"] = true
-		status["auth_file_modified"] = info.ModTime().UTC().Format(time.RFC3339)
-	} else {
-		status["auth_file_present"] = false
-	}
-
-	// borrow() refreshes when needed, so a success here means the credentials
-	// genuinely work — not merely that a file exists.
-	cred, err := s.backendAuth().borrow()
-	if err != nil {
-		status["signed_in"] = false
-		status["error"] = err.Error()
-		writeJSON(w, 200, status)
-		return
-	}
-	status["signed_in"] = true
-	status["account_id"] = cred.AccountID
-	if exp, ok := jwtNumber(cred.AccessToken, "exp"); ok {
-		expiry := time.Unix(int64(exp), 0).UTC()
-		status["expires_at"] = expiry.Format(time.RFC3339)
-		status["expires_in_seconds"] = int64(time.Until(expiry).Seconds())
-	}
-	if payload := jwtPayload(cred.AccessToken); payload != nil {
-		if email, ok := payload["email"].(string); ok {
-			status["email"] = email
+	pool := s.accountPool()
+	accounts := pool.snapshot()
+	ready := 0
+	for _, acct := range accounts {
+		if acct["signed_in"] == true && acct["enabled"] == true && acct["cooling_until"] == nil {
+			ready++
 		}
 	}
-	writeJSON(w, 200, status)
+	writeJSON(w, 200, map[string]any{
+		"accounts":       accounts,
+		"ready_accounts": ready,
+		"auth_dir":       pool.root,
+		"default_model":  s.cfg.Model,
+		"codex_cli":      s.codexCLIPath() != "",
+		"signin":         s.device.snapshot(),
+	})
 }
 
 // codexCLIPath resolves the Codex CLI, which only the device path needs. An
@@ -360,7 +363,10 @@ func (s *server) codexCLIPath() string {
 	return path
 }
 
-func (s *server) uiSignInStart(w http.ResponseWriter, _ *http.Request) {
+// uiSignInStart signs in a new account, or with {"account": id} signs an
+// existing one in again. The CLI writes into a staging CODEX_HOME that the pool
+// does not read, so a login only joins the pool once it is checked.
+func (s *server) uiSignInStart(w http.ResponseWriter, r *http.Request) {
 	cli := s.codexCLIPath()
 	if cli == "" {
 		writeJSON(w, 501, map[string]any{
@@ -369,12 +375,38 @@ func (s *server) uiSignInStart(w http.ResponseWriter, _ *http.Request) {
 		})
 		return
 	}
-	home := filepath.Dir(expandHome(s.cfg.AuthJSON))
-	if err := os.MkdirAll(home, 0700); err != nil {
-		writeJSON(w, 500, map[string]any{"error": "Could not prepare " + home + ": " + err.Error()})
+	var body struct {
+		Account string `json:"account"`
+	}
+	if !decodeUIBody(w, r, &body) {
 		return
 	}
-	if err := s.device.start(cli, home); err != nil {
+	pool := s.accountPool()
+	target, status, err := s.signInTarget(body.Account)
+	if err != nil {
+		writeJSON(w, status, map[string]any{"error": err.Error()})
+		return
+	}
+	staging, err := os.MkdirTemp(filepath.Join(pool.root, accountsDirName), ".signin-")
+	if err != nil {
+		if mkErr := os.MkdirAll(filepath.Join(pool.root, accountsDirName), 0700); mkErr == nil {
+			staging, err = os.MkdirTemp(filepath.Join(pool.root, accountsDirName), ".signin-")
+		}
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": "Could not prepare a sign-in directory: " + err.Error()})
+			return
+		}
+	}
+	onDone := func() (string, bool) {
+		defer func() { _ = os.RemoveAll(staging) }()
+		content, err := os.ReadFile(filepath.Join(staging, "auth.json"))
+		if err != nil {
+			return "The sign-in finished but wrote no auth.json.", true
+		}
+		return s.adoptLogin(target, body.Account == "", content)
+	}
+	if err := s.device.start(cli, staging, target, onDone); err != nil {
+		_ = os.RemoveAll(staging)
 		writeJSON(w, 409, map[string]any{"error": err.Error()})
 		return
 	}
@@ -390,73 +422,134 @@ func (s *server) uiSignInStart(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, s.device.snapshot())
 }
 
+// signInTarget resolves which account a login is for: an existing one when
+// named, otherwise a fresh id.
+func (s *server) signInTarget(account string) (string, int, error) {
+	pool := s.accountPool()
+	if account == "" {
+		id, err := pool.newAccountID()
+		if err != nil {
+			return "", 500, err
+		}
+		return id, 0, nil
+	}
+	pool.rescan()
+	pool.mu.Lock()
+	_, ok := pool.accounts[account]
+	pool.mu.Unlock()
+	if !ok {
+		return "", 404, errUnknownAccount
+	}
+	return account, 0, nil
+}
+
+// adoptLogin writes a checked login into an account slot. A login already held
+// by another account is refused when adding — two copies of one login rotate
+// each other's refresh token until both stop working.
+func (s *server) adoptLogin(target string, adding bool, content []byte) (string, bool) {
+	if err := validateAuthJSON(content); err != nil {
+		return err.Error(), true
+	}
+	pool := s.accountPool()
+	if other := pool.findIdentity(content, target); other != "" {
+		if adding {
+			return fmt.Sprintf("That ChatGPT login is already account %s, so nothing was added. Sign that account in again instead.", other), true
+		}
+		return fmt.Sprintf("That ChatGPT login belongs to account %s, not %s; nothing was changed.", other, target), true
+	}
+	if err := pool.writeAccount(target, content); err != nil {
+		return "Could not save the login: " + err.Error(), true
+	}
+	log.Printf("codex.account.signed_in account=%s added=%t", target, adding)
+	if adding {
+		return fmt.Sprintf("Signed in. Added as account %s.", target), false
+	}
+	return fmt.Sprintf("Signed in. Account %s updated.", target), false
+}
+
 func (s *server) uiSignInCancel(w http.ResponseWriter, _ *http.Request) {
 	s.device.cancel()
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// uiPasteAuth adds a pasted login as a new account, or with "account" replaces
+// that account's login.
 func (s *server) uiPasteAuth(w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		writeJSON(w, 400, map[string]any{"error": "Could not read the request."})
-		return
-	}
 	var body struct {
 		Content string `json:"content"`
+		Account string `json:"account"`
 	}
-	if err := json.Unmarshal(raw, &body); err != nil {
-		writeJSON(w, 400, map[string]any{"error": "Malformed request."})
+	if !decodeUIBody(w, r, &body) {
 		return
 	}
 	if err := validateAuthJSON([]byte(body.Content)); err != nil {
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
 		return
 	}
-	path := expandHome(s.cfg.AuthJSON)
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
-		return
-	}
-	// Write via a temp file in the same directory, then rename: a partial write
-	// must never replace a working login.
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".auth-*.json")
+	target, status, err := s.signInTarget(body.Account)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		writeJSON(w, status, map[string]any{"error": err.Error()})
 		return
 	}
-	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }()
-	if err := tmp.Chmod(0600); err != nil {
-		_ = tmp.Close()
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+	message, failed := s.adoptLogin(target, body.Account == "", []byte(body.Content))
+	if failed {
+		writeJSON(w, 409, map[string]any{"error": message})
 		return
 	}
-	if _, err := tmp.WriteString(body.Content); err != nil {
-		_ = tmp.Close()
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+	writeJSON(w, 200, map[string]any{"ok": true, "account": target, "message": message})
+}
+
+func (s *server) uiSetEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	var body struct {
+		Account string `json:"account"`
+	}
+	if !decodeUIBody(w, r, &body) {
 		return
 	}
-	if err := tmp.Close(); err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+	if err := s.accountPool().setEnabled(body.Account, enabled); err != nil {
+		writeAccountError(w, err)
 		return
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
-		return
-	}
-	// The reader caches on (mtime, size); drop it so the new file is picked up.
-	s.backendAuth().invalidate()
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-func (s *server) uiDeleteAuth(w http.ResponseWriter, _ *http.Request) {
-	path := expandHome(s.cfg.AuthJSON)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+func (s *server) uiRemoveAccount(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Account string `json:"account"`
+	}
+	if !decodeUIBody(w, r, &body) {
 		return
 	}
-	s.backendAuth().invalidate()
+	if err := s.accountPool().remove(body.Account); err != nil {
+		writeAccountError(w, err)
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func writeAccountError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errUnknownAccount) {
+		writeJSON(w, 404, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 500, map[string]any{"error": err.Error()})
+}
+
+// decodeUIBody reads a small JSON body; an empty body decodes as {}.
+func decodeUIBody(w http.ResponseWriter, r *http.Request, into any) bool {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": "Could not read the request."})
+		return false
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return true
+	}
+	if err := json.Unmarshal(raw, into); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "Malformed request."})
+		return false
+	}
+	return true
 }
 
 // validateAuthJSON rejects content the reader would later choke on, so a bad

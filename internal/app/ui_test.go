@@ -54,7 +54,8 @@ func TestUIRefusesToServeWithoutAPIKey(t *testing.T) {
 func TestUIRejectsUnauthenticatedAPICalls(t *testing.T) {
 	s, _ := newUITestServer(t, "secret")
 	for _, path := range []string{
-		"/ui/api/status", "/ui/api/signin/start", "/ui/api/auth/paste", "/ui/api/auth/delete",
+		"/ui/api/status", "/ui/api/signin/start", "/ui/api/auth/paste",
+		"/ui/api/accounts/enable", "/ui/api/accounts/disable", "/ui/api/accounts/remove",
 	} {
 		method := http.MethodPost
 		if strings.HasSuffix(path, "status") {
@@ -146,7 +147,7 @@ func TestValidateAuthJSONRejectsUnusableContent(t *testing.T) {
 	}
 }
 
-func TestUIPasteWritesAuthFilePrivatelyAndDeleteRemovesIt(t *testing.T) {
+func TestUIPasteWritesAuthFilePrivatelyAndRemoveDeletesIt(t *testing.T) {
 	s, authPath := newUITestServer(t, "secret")
 	session := uiRequest(s, http.MethodPost, "/ui/api/login", `{"key":"secret"}`, nil).Result().Cookies()[0]
 
@@ -179,8 +180,8 @@ func TestUIPasteWritesAuthFilePrivatelyAndDeleteRemovesIt(t *testing.T) {
 		}
 	}
 
-	if rec := uiRequest(s, http.MethodPost, "/ui/api/auth/delete", "{}", session); rec.Code != 200 {
-		t.Fatalf("delete = %d", rec.Code)
+	if rec := uiRequest(s, http.MethodPost, "/ui/api/accounts/remove", `{"account":"default"}`, session); rec.Code != 200 {
+		t.Fatalf("remove = %d body=%s", rec.Code, rec.Body.String())
 	}
 	if _, err := os.Stat(authPath); !os.IsNotExist(err) {
 		t.Fatal("auth.json should be gone after delete")

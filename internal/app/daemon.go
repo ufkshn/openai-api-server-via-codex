@@ -144,7 +144,7 @@ func sanitizePathPart(value string) string {
 }
 
 func startDaemon(cfg config, paths daemonPaths) error {
-	if _, err := newBackend(cfg).auth.borrow(); err != nil {
+	if err := newBackend(cfg).pool.preflight(); err != nil {
 		return preflightAuthError(err)
 	}
 	if pid := readPID(paths.PIDFile); pid > 0 {
