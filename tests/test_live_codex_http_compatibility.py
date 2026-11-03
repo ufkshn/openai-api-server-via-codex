@@ -21,7 +21,7 @@ RED_SQUARE_PNG_DATA_URL = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC"
 )
-LIVE_LONG_TEST_MODEL = os.environ.get("OPENAI_VIA_CODEX_TEST_MODEL", "gpt-5.4-mini")
+LIVE_LONG_TEST_MODEL = os.environ.get("OPENAI_VIA_CODEX_TEST_MODEL", "gpt-6-luna")
 
 
 @pytest.mark.asyncio
@@ -249,6 +249,16 @@ async def test_live_codex_http_handles_openai_client_compatibility_matrix() -> N
                 backend_name,
             )
             await _assert_chat_streaming_tool_call(
+                client,
+                LIVE_LONG_TEST_MODEL,
+                backend_name,
+            )
+            await _assert_chat_streaming_parallel_tool_calls(
+                client,
+                LIVE_LONG_TEST_MODEL,
+                backend_name,
+            )
+            await _assert_chat_stream_helper_tool_call_after_text(
                 client,
                 LIVE_LONG_TEST_MODEL,
                 backend_name,
@@ -1321,6 +1331,10 @@ async def _assert_chat_legacy_functions(
     _assert_chat_api_shape(first, backend_name)
     function_call = first.choices[0].message.function_call
     assert function_call is not None, (backend_name, first.model_dump(mode="json"))
+    assert first.choices[0].finish_reason == "function_call", (
+        backend_name,
+        first.model_dump(mode="json"),
+    )
     arguments = _json_object(function_call.arguments)
     assert arguments.get("invoice_id") == "INV-5150", (
         backend_name,
@@ -1373,6 +1387,89 @@ async def _assert_chat_legacy_functions(
     print(f"{backend_name} chat legacy function result: {_short_text(second_text)}")
     assert _contains_marker(second_text, marker), (backend_name, second_text)
     assert "paid" in second_text.lower(), (backend_name, second_text)
+
+    await _assert_chat_legacy_function_stream(client, model, backend_name)
+    await _assert_chat_legacy_repeated_function_history(client, model, backend_name)
+
+
+async def _assert_chat_legacy_function_stream(
+    client: AsyncOpenAI, model: str, backend_name: str
+) -> None:
+    stream = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Call emit_legacy_probe with probe_id LEGACY-STREAM-1. "
+                    "Do not answer directly."
+                ),
+            },
+        ],
+        functions=cast(Any, [_probe_function("emit_legacy_probe")]),
+        stream=True,
+        reasoning_effort="low",
+    )
+    name = ""
+    arguments_text = ""
+    finish_reasons: list[str] = []
+    async for chunk in stream:
+        for choice in chunk.choices:
+            if choice.finish_reason:
+                finish_reasons.append(choice.finish_reason)
+            if choice.delta.function_call:
+                name += choice.delta.function_call.name or ""
+                arguments_text += choice.delta.function_call.arguments or ""
+    print(f"{backend_name} chat legacy stream: name={name} args={arguments_text}")
+    assert name == "emit_legacy_probe", (backend_name, name)
+    assert _json_object(arguments_text).get("probe_id") == "LEGACY-STREAM-1", (
+        backend_name,
+        arguments_text,
+    )
+    assert finish_reasons == ["function_call"], (backend_name, finish_reasons)
+
+
+async def _assert_chat_legacy_repeated_function_history(
+    client: AsyncOpenAI, model: str, backend_name: str
+) -> None:
+    def call(probe_id: str) -> dict[str, Any]:
+        return {
+            "role": "assistant",
+            "content": None,
+            "function_call": {
+                "name": "emit_legacy_probe",
+                "arguments": json.dumps({"probe_id": probe_id}),
+            },
+        }
+
+    def result(marker: str) -> dict[str, Any]:
+        return {"role": "function", "name": "emit_legacy_probe", "content": marker}
+
+    first_marker = f"{backend_name}-REPEAT-A-11"
+    second_marker = f"{backend_name}-REPEAT-B-22"
+    completion = await client.chat.completions.create(
+        model=model,
+        messages=cast(
+            Any,
+            [
+                {"role": "user", "content": "Probe twice."},
+                call("A"),
+                result(first_marker),
+                call("B"),
+                result(second_marker),
+                {
+                    "role": "user",
+                    "content": "Repeat both function results exactly, first A then B.",
+                },
+            ],
+        ),
+        functions=cast(Any, [_probe_function("emit_legacy_probe")]),
+        function_call="none",
+        reasoning_effort="low",
+    )
+    text = completion.choices[0].message.content or ""
+    print(f"{backend_name} chat legacy repeated history: {_short_text(text)}")
+    _assert_contains_markers(text, [first_marker, second_marker], backend_name)
 
 
 async def _assert_chat_stream_include_usage(
@@ -1563,6 +1660,95 @@ async def _assert_chat_streaming_tool_call(
     )
 
 
+async def _assert_chat_streaming_parallel_tool_calls(
+    client: AsyncOpenAI, model: str, backend_name: str
+) -> None:
+    stream = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Call emit_parallel_probe in parallel in this one turn, once "
+                    "with probe_id PAR-1 and once with probe_id PAR-2. "
+                    "Do not answer directly."
+                ),
+            },
+        ],
+        tools=cast(
+            Any,
+            [
+                {
+                    "type": "function",
+                    "function": _probe_function("emit_parallel_probe"),
+                }
+            ],
+        ),
+        stream=True,
+        reasoning_effort="low",
+    )
+
+    arguments_by_index: dict[int, str] = {}
+    async for chunk in stream:
+        for choice in chunk.choices:
+            for tool_call in choice.delta.tool_calls or []:
+                if tool_call.function:
+                    arguments_by_index[tool_call.index] = arguments_by_index.get(
+                        tool_call.index, ""
+                    ) + (tool_call.function.arguments or "")
+
+    print(f"{backend_name} chat streaming parallel tools: {arguments_by_index}")
+    assert sorted(arguments_by_index) == [0, 1], (backend_name, arguments_by_index)
+    probe_ids = sorted(
+        str(_json_object(text).get("probe_id")) for text in arguments_by_index.values()
+    )
+    assert probe_ids == ["PAR-1", "PAR-2"], (backend_name, arguments_by_index)
+
+
+async def _assert_chat_stream_helper_tool_call_after_text(
+    client: AsyncOpenAI, model: str, backend_name: str
+) -> None:
+    # The model occasionally skips the text, and without text before the call
+    # this would not exercise the index mapping.
+    for _ in range(3):
+        async with client.chat.completions.stream(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "First write the single word Checking as text, then call "
+                        "emit_text_probe with probe_id TEXT-1."
+                    ),
+                },
+            ],
+            tools=cast(
+                Any,
+                [
+                    {
+                        "type": "function",
+                        "function": _probe_function("emit_text_probe"),
+                    }
+                ],
+            ),
+            reasoning_effort="low",
+        ) as stream:
+            final = await stream.get_final_completion()
+        message = final.choices[0].message
+        print(
+            f"{backend_name} chat stream helper text then tool: "
+            f"content={message.content!r} tool_calls={message.tool_calls}"
+        )
+        if message.content:
+            break
+
+    assert "checking" in (message.content or "").lower(), (backend_name, message)
+    assert message.tool_calls, (backend_name, message)
+    assert _json_object(message.tool_calls[0].function.arguments) == {
+        "probe_id": "TEXT-1"
+    }, (backend_name, message)
+
+
 def _assert_sync_client_smoke(
     base_url: str, model: str, backend_name: str
 ) -> None:
@@ -1746,10 +1932,10 @@ def _select_model(models: list[str]) -> str:
     requested = os.environ.get("OPENAI_VIA_CODEX_TEST_MODEL")
     if requested:
         return requested
-    for preferred in ("gpt-5.4-mini", "gpt-5.4", "gpt-5.5"):
+    for preferred in ("gpt-6-luna", "gpt-5.4-mini", "gpt-5.4", "gpt-5.5"):
         if preferred in models:
             return preferred
-    return models[0] if models else "gpt-5.4"
+    return models[0] if models else "gpt-6-luna"
 
 
 def _free_port() -> int:

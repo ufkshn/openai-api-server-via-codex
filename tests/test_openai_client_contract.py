@@ -10,12 +10,11 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import httpx
 import pytest
 from openai import (
-    APIError,
     AsyncOpenAI,
     ConflictError,
     InternalServerError,
@@ -45,9 +44,21 @@ def _flatten_text(value: Any) -> str:
     return ""
 
 
+def _has_prompt_cache_breakpoint(value: Any) -> bool:
+    for item in value or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and "prompt_cache_breakpoint" in part
+            for part in content
+        ):
+            return True
+    return False
+
+
 class _FakeCodexHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     counter = 0
+    last_payload: ClassVar[dict[str, Any]] = {}
 
     def log_message(self, format: str, *args: Any) -> None:
         del format, args
@@ -90,14 +101,47 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
         self._proxy_response()
 
     def _responses_stream(self, payload: dict[str, Any]) -> None:
+        type(self).last_payload = payload
+        input_text = json.dumps(payload.get("input"))
+        for code in ("server_error", "rate_limit_exceeded"):
+            if f"CONTRACT_FAILED_{code}" in input_text:
+                self._failed_stream(payload, code)
+                return
+        if "CONTRACT_STREAM_CLOSED" in input_text:
+            self._failed_stream(payload, "server_error", terminal=False)
+            return
+        if "CONTRACT_CONTENT_FILTER" in input_text:
+            self._content_filter_stream(payload)
+            return
         if payload.get("metadata", {}).get("contract") == "async_history":
             self._async_history_stream(payload)
+            return
+        tools = payload.get("tools") or []
+        if any(tool.get("name") == "lookup_city" for tool in tools):
+            self._parallel_tool_stream(payload)
+            return
+        if any(tool.get("name") == "lookup_after_text" for tool in tools):
+            self._parallel_tool_stream(
+                payload, name="lookup_after_text", text="Checking"
+            )
+            return
+        if _has_prompt_cache_breakpoint(payload.get("input")):
+            self._json(
+                {
+                    "error": {
+                        "message": "prompt_cache_breakpoint is not supported on this model",
+                        "type": "api_error",
+                        "code": None,
+                        "param": None,
+                    }
+                },
+                status=400,
+            )
             return
         type(self).counter += 1
         number = type(self).counter
         response_id = f"resp_contract_{number}"
         created = time.time()
-        tools = payload.get("tools") or []
         is_image = any(tool.get("type") == "image_generation" for tool in tools)
         is_tool = any(tool.get("type") == "function" for tool in tools)
 
@@ -395,6 +439,162 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _content_filter_stream(self, payload: dict[str, Any]) -> None:
+        self._write_events(
+            [
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "Partial",
+                },
+                {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp_filtered",
+                        "object": "response",
+                        "created_at": 0,
+                        "model": payload["model"],
+                        "status": "incomplete",
+                        "output": [],
+                        "incomplete_details": {"reason": "content_filter"},
+                    },
+                },
+            ]
+        )
+
+    def _failed_stream(
+        self, payload: dict[str, Any], code: str, terminal: bool = True
+    ) -> None:
+        events = [
+            {
+                "type": "response.created",
+                "response": {"id": "resp_failed", "status": "in_progress"},
+            },
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "Partial",
+            },
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_failed",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": payload["model"],
+                    "status": "failed",
+                    "output": [],
+                    "error": {"code": code, "message": f"contract {code}"},
+                },
+            },
+        ]
+        self._write_events(events if terminal else events[:-1])
+
+    def _write_events(self, events: list[dict[str, Any]]) -> None:
+        encoded = "".join(
+            "data: " + json.dumps({**event, "sequence_number": index}) + "\n\n"
+            for index, event in enumerate(events)
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _parallel_tool_stream(
+        self,
+        payload: dict[str, Any],
+        name: str = "lookup_city",
+        text: str | None = None,
+    ) -> None:
+        # Codex sends no function_call_arguments.delta events for parallel
+        # tool calls; the arguments arrive only on output_item.done.
+        type(self).counter += 1
+        rid = f"resp_parallel_{type(self).counter}"
+        items = [
+            {
+                "id": f"fc_parallel_{index}",
+                "type": "function_call",
+                "call_id": f"call_parallel_{index}",
+                "name": name,
+                "arguments": json.dumps({"city": city}),
+                "status": "completed",
+            }
+            for index, city in enumerate(["Paris", "Tokyo"])
+        ]
+        message = {
+            "id": "msg_parallel",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+        offset = 0 if text is None else 1
+        response = {
+            "id": rid,
+            "object": "response",
+            "created_at": 0,
+            "model": payload["model"],
+            "status": "completed",
+            "output": [message, *items] if offset else items,
+            "parallel_tool_calls": True,
+            "usage": {"input_tokens": 3, "output_tokens": 5, "total_tokens": 8},
+        }
+        events: list[dict[str, Any]] = [
+            {
+                "type": "response.created",
+                "response": {**response, "status": "in_progress", "output": []},
+            }
+        ]
+        if offset:
+            events.extend(
+                [
+                    {
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "item_id": message["id"],
+                        "delta": text,
+                    },
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": message,
+                    },
+                ]
+            )
+        for index, item in enumerate(items, start=offset):
+            events.extend(
+                [
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": index,
+                        "item": {**item, "arguments": "", "status": "in_progress"},
+                    },
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "output_index": index,
+                        "item_id": item["id"],
+                        "arguments": item["arguments"],
+                    },
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": index,
+                        "item": item,
+                    },
+                ]
+            )
+        events.append({"type": "response.completed", "response": response})
+        encoded = "".join(
+            "data: " + json.dumps({**event, "sequence_number": index}) + "\n\n"
+            for index, event in enumerate(events)
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def _json(
         self,
         value: Any,
@@ -458,6 +658,8 @@ def runtime_server(
         str(auth_json),
         "--backend-base-url",
         fake_codex_url,
+        "--max-retries",
+        "0",
         "--max-stored-items",
         "100",
         "--api-key",
@@ -538,6 +740,28 @@ async def test_contract_health_and_models(runtime_server: tuple[str, str]) -> No
     assert root_with_slash.json()["request_path"].endswith("/backend-api/codex/"), (
         runtime
     )
+
+
+async def test_contract_strips_prompt_cache_breakpoint(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+    created = await contract_client.responses.create(
+        model="gpt-5.6-luna",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "cache boundary marker",
+                        "prompt_cache_breakpoint": {"mode": "explicit"},
+                    }
+                ],
+            }
+        ],
+    )
+    assert "cache boundary marker" in created.output_text, runtime
 
 
 async def test_contract_responses_lifecycle_and_streaming(
@@ -709,30 +933,364 @@ async def test_contract_chat_lifecycle_streaming_and_tools(
 async def test_contract_chat_raises_upstream_overload(
     contract_client: AsyncOpenAI,
 ) -> None:
-    """An upstream failure must raise in the SDK, not arrive as an empty completion."""
+    """An upstream failure must raise in the SDK, not arrive as an empty completion.
+
+    The overload arrives before any output, so the streamed request fails as a real
+    HTTP error too, which is what lets the SDK raise its typed error.
+    """
+    client = contract_client.with_options(max_retries=0)
     messages: Any = [{"role": "user", "content": "FAKE_OVERLOADED"}]
     with pytest.raises(InternalServerError) as raised:
-        await contract_client.chat.completions.create(
-            model="gpt-6-sol", messages=messages
-        )
+        await client.chat.completions.create(model="gpt-6-sol", messages=messages)
     assert raised.value.status_code == 503
     assert raised.value.code == "server_is_overloaded"
 
+    with pytest.raises(InternalServerError) as streamed:
+        stream = await client.chat.completions.create(
+            model="gpt-6-sol",
+            messages=messages,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        async for _ in stream:
+            pass
+    assert streamed.value.status_code == 503
+    assert streamed.value.code == "server_is_overloaded"
+
+
+async def test_contract_chat_streams_parallel_tool_call_arguments(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
     stream = await contract_client.chat.completions.create(
-        model="gpt-6-sol",
-        messages=messages,
+        model="gpt-5.6-luna",
+        messages=[{"role": "user", "content": "look up Paris and Tokyo"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup_city",
+                    "description": "Look up a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
         stream=True,
-        stream_options={"include_usage": True},
     )
-    chunks = []
-    with pytest.raises(APIError) as streamed:
+    names: dict[int, str] = {}
+    arguments: dict[int, str] = {}
+    async for chunk in stream:
+        for choice in chunk.choices:
+            for call in choice.delta.tool_calls or []:
+                if call.function is None:
+                    continue
+                names[call.index] = names.get(call.index, "") + (
+                    call.function.name or ""
+                )
+                arguments[call.index] = arguments.get(call.index, "") + (
+                    call.function.arguments or ""
+                )
+    assert names == {0: "lookup_city", 1: "lookup_city"}, runtime
+    assert {index: json.loads(value) for index, value in arguments.items()} == {
+        0: {"city": "Paris"},
+        1: {"city": "Tokyo"},
+    }, runtime
+
+
+async def test_contract_chat_stream_helper_indexes_tool_calls_after_text(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+    async with contract_client.chat.completions.stream(
+        model="gpt-5.6-luna",
+        messages=[{"role": "user", "content": "say something, then look up cities"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup_after_text",
+                    "strict": True,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+    ) as stream:
+        final = await stream.get_final_completion()
+    message = final.choices[0].message
+    assert message.content == "Checking", runtime
+    assert message.tool_calls is not None, runtime
+    assert [
+        (call.function.name, json.loads(call.function.arguments))
+        for call in message.tool_calls
+    ] == [
+        ("lookup_after_text", {"city": "Paris"}),
+        ("lookup_after_text", {"city": "Tokyo"}),
+    ], runtime
+
+
+async def test_contract_chat_legacy_function_stream_returns_first_call(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+    stream = await contract_client.chat.completions.create(
+        model="gpt-5.6-luna",
+        messages=[{"role": "user", "content": "look up Paris and Tokyo"}],
+        functions=[
+            {
+                "name": "lookup_city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            }
+        ],
+        stream=True,
+    )
+    name = ""
+    arguments = ""
+    finish_reason = None
+    async for chunk in stream:
+        for choice in chunk.choices:
+            finish_reason = choice.finish_reason or finish_reason
+            call = choice.delta.function_call
+            if call is not None:
+                name += call.name or ""
+                arguments += call.arguments or ""
+    assert name == "lookup_city", runtime
+    assert json.loads(arguments) == {"city": "Paris"}, runtime
+    assert finish_reason == "function_call", runtime
+
+
+async def test_contract_chat_legacy_function_call_finish_reason(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+    completion = await contract_client.chat.completions.create(
+        model="gpt-5.6-luna",
+        messages=[{"role": "user", "content": "look up Paris"}],
+        functions=[
+            {
+                "name": "lookup_city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            }
+        ],
+    )
+    choice = completion.choices[0]
+    assert choice.finish_reason == "function_call", runtime
+    assert choice.message.content is None, runtime
+    assert choice.message.function_call is not None, runtime
+    assert json.loads(choice.message.function_call.arguments) == {"city": "Paris"}
+
+
+async def test_contract_chat_replays_legacy_function_history(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+
+    def call(city: str, content: str | None) -> dict[str, Any]:
+        return {
+            "role": "assistant",
+            "content": content,
+            "function_call": {
+                "name": "lookup_history",
+                "arguments": json.dumps({"city": city}),
+            },
+        }
+
+    def result(content: str) -> dict[str, Any]:
+        return {"role": "function", "name": "lookup_history", "content": content}
+
+    await contract_client.chat.completions.create(
+        model="gpt-5.6-luna",
+        messages=cast(
+            Any,
+            [
+                {"role": "user", "content": "compare the cities"},
+                call("Paris", None),
+                result("sunny"),
+                call("Tokyo", "Checking"),
+                result("rainy"),
+            ],
+        ),
+    )
+    replayed = [
+        (
+            item.get("type") or item["role"],
+            item.get("call_id"),
+        )
+        for item in _FakeCodexHandler.last_payload["input"]
+    ]
+    assert replayed == [
+        ("user", None),
+        ("function_call", "call_legacy_1"),
+        ("function_call_output", "call_legacy_1"),
+        ("assistant", None),
+        ("function_call", "call_legacy_2"),
+        ("function_call_output", "call_legacy_2"),
+    ], runtime
+
+
+async def test_contract_chat_tools_ignore_empty_legacy_functions(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+    completion = await contract_client.chat.completions.create(
+        model="gpt-5.6-luna",
+        messages=[{"role": "user", "content": "look up Paris and Tokyo"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup_city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        extra_body={"functions": []},
+    )
+    choice = completion.choices[0]
+    assert choice.finish_reason == "tool_calls", runtime
+    assert choice.message.function_call is None, runtime
+    assert choice.message.tool_calls is not None, runtime
+    assert len(choice.message.tool_calls) == 2, runtime
+    assert _FakeCodexHandler.last_payload["parallel_tool_calls"] is True, runtime
+
+
+async def test_contract_chat_raises_sdk_errors_for_failed_responses(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    from openai import APIError, InternalServerError, RateLimitError
+
+    runtime, _ = runtime_server
+    client = contract_client.with_options(max_retries=0)
+
+    with pytest.raises(RateLimitError) as limited:
+        await client.chat.completions.create(
+            model="gpt-5.6-luna",
+            messages=[
+                {"role": "user", "content": "CONTRACT_FAILED_rate_limit_exceeded"}
+            ],
+        )
+    assert limited.value.code == "rate_limit_exceeded", runtime
+
+    with pytest.raises(InternalServerError) as broken:
+        await client.chat.completions.create(
+            model="gpt-5.6-luna",
+            messages=[{"role": "user", "content": "CONTRACT_FAILED_server_error"}],
+            store=True,
+        )
+    assert broken.value.status_code == 502, runtime
+    assert broken.value.code == "server_error", runtime
+
+    stream = await client.chat.completions.create(
+        model="gpt-5.6-luna",
+        messages=[{"role": "user", "content": "CONTRACT_FAILED_server_error"}],
+        stream=True,
+    )
+    received = ""
+    with pytest.raises(APIError) as failed:
         async for chunk in stream:
-            chunks.append(chunk)
-    assert "overloaded" in streamed.value.message
-    assert all(
-        choice.finish_reason is None for chunk in chunks for choice in chunk.choices
+            for choice in chunk.choices:
+                received += choice.delta.content or ""
+                assert choice.finish_reason is None, runtime
+    assert received == "Partial", runtime
+    assert failed.value.message == "contract server_error", runtime
+    assert failed.value.code == "server_error", runtime
+
+
+async def test_contract_chat_raises_sdk_errors_for_closed_streams(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    from openai import APIError, InternalServerError
+
+    runtime, _ = runtime_server
+    client = contract_client.with_options(max_retries=0)
+    messages: Any = [{"role": "user", "content": "CONTRACT_STREAM_CLOSED"}]
+
+    with pytest.raises(InternalServerError) as closed:
+        await client.chat.completions.create(model="gpt-5.6-luna", messages=messages)
+    assert closed.value.status_code == 502, runtime
+
+    stream = await client.chat.completions.create(
+        model="gpt-5.6-luna", messages=messages, stream=True
     )
-    assert all(chunk.usage is None for chunk in chunks)
+    received = ""
+    with pytest.raises(APIError) as failed:
+        async for chunk in stream:
+            for choice in chunk.choices:
+                received += choice.delta.content or ""
+    assert received == "Partial", runtime
+    assert "closed before" in failed.value.message, runtime
+
+
+async def test_contract_chat_reports_content_filter_finish_reason(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+    messages: Any = [{"role": "user", "content": "CONTRACT_CONTENT_FILTER"}]
+    completion = await contract_client.chat.completions.create(
+        model="gpt-5.6-luna", messages=messages
+    )
+    assert completion.choices[0].finish_reason == "content_filter", runtime
+
+    stream = await contract_client.chat.completions.create(
+        model="gpt-5.6-luna", messages=messages, stream=True
+    )
+    reasons = [
+        choice.finish_reason
+        async for chunk in stream
+        for choice in chunk.choices
+        if choice.finish_reason
+    ]
+    assert reasons == ["content_filter"], runtime
+
+
+async def test_contract_chat_keeps_text_before_tool_calls_when_stored(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+    completion = await contract_client.chat.completions.create(
+        model="gpt-5.6-luna",
+        messages=[{"role": "user", "content": "say something, then look up cities"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup_after_text",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        store=True,
+    )
+    message = completion.choices[0].message
+    assert message.content == "Checking", runtime
+    assert message.tool_calls is not None and len(message.tool_calls) == 2, runtime
+    retrieved = await contract_client.chat.completions.retrieve(completion.id)
+    assert retrieved.choices[0].message.content == "Checking", runtime
+    assert retrieved.choices[0].message.tool_calls is not None, runtime
 
 
 async def test_contract_images_audio_and_unknown_proxy(
@@ -1132,8 +1690,6 @@ def test_contract_websocket_sync_and_background_rejection(
 async def test_contract_http_async_history(
     contract_client: AsyncOpenAI, stream: bool
 ) -> None:
-    from openai.types.responses import ResponseInputParam
-
     first_items: list[dict[str, Any]] = []
     metadata = {"contract": "async_history"}
     if stream:
@@ -1178,21 +1734,18 @@ async def test_contract_http_async_history(
             model="gpt-6-astra",
             metadata=metadata,
             previous_response_id=pending.id,
-            input=cast(
-                ResponseInputParam,
-                [
-                    {
-                        "type": "function_call_output",
-                        "call_id": "call_history",
-                        "output": [{"type": "input_text", "text": "value"}],
-                    },
-                    {
-                        "type": "custom_tool_call_output",
-                        "call_id": "call_custom",
-                        "output": "custom result",
-                    },
-                ],
-            ),
+            input=[
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_history",
+                    "output": [{"type": "input_text", "text": "value"}],
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_custom",
+                    "output": "custom result",
+                },
+            ],
         )
         assert final.output_text == "FINAL_OK"
 

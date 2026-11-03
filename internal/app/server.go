@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,8 +102,8 @@ func serve(cfg config, version string) error {
 	log.Print(startupLogMessage(version, boundAddress))
 	if cfg.Verbose {
 		log.Printf(
-			"settings.resolved host=%s port=%d model=%s timeout=%s max_stored_items=%d max_concurrent_requests=%d auth_json=%s backend_base_url=%s api_key_configured=%t",
-			cfg.Host, cfg.Port, cfg.Model, cfg.Timeout, cfg.MaxStored, cfg.Concurrency,
+			"settings.resolved host=%s port=%d model=%s timeout=%s max_retries=%d max_stored_items=%d max_concurrent_requests=%d auth_json=%s backend_base_url=%s api_key_configured=%t",
+			cfg.Host, cfg.Port, cfg.Model, cfg.Timeout, cfg.MaxRetries, cfg.MaxStored, cfg.Concurrency,
 			cfg.AuthJSON, cfg.BackendURL, cfg.APIKey != "",
 		)
 	}
@@ -433,7 +434,13 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, prepared
 		return nil
 	})
 	if err != nil {
-		writeSSE(w, map[string]any{"type": "error", "sequence_number": seq, "code": nil, "message": publicStreamError(err), "param": nil})
+		if seq == 0 {
+			clearSSE(w)
+			writeBackendError(w, err)
+			return
+		}
+		failure := publicErrorObject(err)
+		writeSSE(w, map[string]any{"type": "error", "sequence_number": seq, "code": failure["code"], "message": failure["message"], "param": failure["param"]})
 	}
 	io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -603,7 +610,7 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responsePayload := chatToResponse(body, s.cfg.Model)
-	legacy := body["functions"] != nil || body["function_call"] != nil
+	legacy := usesLegacyFunctions(body)
 	if boolValue(body["stream"]) {
 		s.streamChat(w, r, responsePayload, body, legacy)
 		return
@@ -617,8 +624,8 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 		writeBackendError(w, err)
 		return
 	}
-	if stringValue(response["status"]) == "failed" {
-		writeBackendError(w, failureFromDetail(mapOrEmpty(response["error"])))
+	if err := failedResponseError(response); err != nil {
+		writeBackendError(w, err)
 		return
 	}
 	response = ensureResponse(response, responsePayload)
@@ -645,28 +652,23 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 	state := chatStreamState{ID: newID("chatcmpl"), Created: int(time.Now().Unix()), Model: stringValue(responsePayload["model"]), ChoiceCount: chatChoiceCount(body["n"])}
 	includeUsage := boolValue(mapAny(body["stream_options"])["include_usage"])
 	var outputs []any
-	emitted := map[int]string{}
-	var failure *upstreamFailure
+	toolCalls := map[int]*chatStreamToolCall{}
+	// toolCall returns nil for a call the client must not see. A legacy
+	// function_call delta has no index, so a second call would merge into the
+	// first, and non-streaming responses also keep only the first call.
+	toolCall := func(event map[string]any) *chatStreamToolCall {
+		outputIndex := intValue(event["output_index"])
+		call, ok := toolCalls[outputIndex]
+		if !ok {
+			call = &chatStreamToolCall{index: len(toolCalls)}
+			toolCalls[outputIndex] = call
+		}
+		if legacy && call.index > 0 {
+			return nil
+		}
+		return call
+	}
 	emit := func(v map[string]any) { writeSSE(w, v); flusher.Flush() }
-	emitArguments := func(idx int, delta string) {
-		emitted[idx] += delta
-		var d map[string]any
-		if legacy {
-			d = map[string]any{"function_call": map[string]any{"arguments": delta}}
-		} else {
-			d = map[string]any{"tool_calls": []any{map[string]any{"index": idx, "function": map[string]any{"arguments": delta}}}}
-		}
-		emit(chatChunk(state, d, nil, nil, nil))
-	}
-	// emittedRest is the part of a call's final arguments not yet streamed as deltas. A
-	// final value that does not extend what was streamed cannot be corrected and is left alone.
-	emittedRest := func(idx int, final string) string {
-		sent := emitted[idx]
-		if len(final) <= len(sent) || !strings.HasPrefix(final, sent) {
-			return ""
-		}
-		return final[len(sent):]
-	}
 	role := func() {
 		if !state.RoleSent {
 			state.RoleSent = true
@@ -674,19 +676,17 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 		}
 	}
 	err := s.backend.stream(r.Context(), responsePayload, func(event map[string]any) error {
-		if failure != nil {
-			return nil
-		}
-		if failure = failureFromEvent(event); failure != nil {
-			return nil
-		}
 		typ := stringValue(event["type"])
+		// Keep the role back until the attempt is known to be producing a
+		// response, so an early failure can still be a real HTTP error.
+		if !isLifecycleEvent(typ) && typ != "error" && typ != "response.failed" {
+			role()
+		}
 		switch typ {
 		case "response.created":
 			if resp := mapAny(event["response"]); resp != nil {
 				state.update(resp)
 			}
-			role()
 		case "response.output_text.delta":
 			role()
 			if delta := stringValue(event["delta"]); delta != "" {
@@ -696,34 +696,43 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 		case "response.output_item.added":
 			item := mapAny(event["item"])
 			if item != nil && item["type"] == "function_call" {
-				role()
-				idx := intValue(event["output_index"])
-				emitted[idx] = ""
-				emit(chatChunk(state, toolDelta(item, idx, "", true, legacy), nil, nil, nil))
+				if call := toolCall(event); call != nil {
+					role()
+					call.started, call.sent = true, ""
+					emit(chatChunk(state, toolDelta(item, call.index, "", legacy), nil, nil, nil))
+				}
 			}
 		case "response.function_call_arguments.delta":
-			role()
-			idx := intValue(event["output_index"])
-			emitArguments(idx, stringValue(event["delta"]))
-		case "response.function_call_arguments.done":
-			// Codex may send no deltas at all and deliver the arguments only here.
-			idx := intValue(event["output_index"])
-			if rest := emittedRest(idx, stringValue(event["arguments"])); rest != "" {
+			if call := toolCall(event); call != nil {
 				role()
-				emitArguments(idx, rest)
+				delta := stringValue(event["delta"])
+				call.started = true
+				call.sent += delta
+				emit(chatChunk(state, argumentsDelta(call.index, delta, legacy), nil, nil, nil))
 			}
 		case "response.output_item.done":
 			item := mapAny(event["item"])
 			if item != nil {
 				outputs = append(outputs, item)
 				if item["type"] == "function_call" {
-					idx := intValue(event["output_index"])
-					if _, ok := emitted[idx]; !ok {
-						role()
-						emitted[idx] = stringValue(item["arguments"])
-						emit(chatChunk(state, toolDelta(item, idx, emitted[idx], true, legacy), nil, nil, nil))
-					} else if rest := emittedRest(idx, stringValue(item["arguments"])); rest != "" {
-						emitArguments(idx, rest)
+					if call := toolCall(event); call != nil {
+						args := stringValue(item["arguments"])
+						if !call.started {
+							role()
+							call.started, call.sent = true, args
+							emit(chatChunk(state, toolDelta(item, call.index, args, legacy), nil, nil, nil))
+						} else if rest, found := strings.CutPrefix(args, call.sent); found {
+							// Parallel tool calls arrive with no argument deltas, so the
+							// final item carries arguments the client has not seen yet.
+							if rest != "" {
+								call.sent = args
+								emit(chatChunk(state, argumentsDelta(call.index, rest, legacy), nil, nil, nil))
+							}
+						} else if !equivalentJSON(call.sent, args) {
+							// Sent chunks cannot be retracted. Arguments are model output,
+							// so log only their sizes.
+							log.Printf("chat.stream.tool_arguments_mismatch output_index=%d sent_bytes=%d final_bytes=%d", intValue(event["output_index"]), len(call.sent), len(args))
+						}
 					}
 				} else if item["type"] == "message" && !state.SawText {
 					if text := messageText(item); text != "" {
@@ -733,8 +742,16 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 					}
 				}
 			}
-		case "response.completed", "response.incomplete":
+		case "error":
+			return responseFailure(errorEventDetail(event))
+		case "response.completed", "response.incomplete", "response.failed":
 			resp := mapAny(event["response"])
+			if typ == "response.failed" {
+				return responseFailure(failureDetail(resp["error"]))
+			}
+			if err := failedResponseError(resp); err != nil {
+				return err
+			}
 			if resp != nil {
 				if len(sliceAny(resp["output"])) == 0 && len(outputs) > 0 {
 					resp["output"] = outputs
@@ -759,68 +776,16 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 		}
 		return nil
 	})
-	if failure != nil {
-		emit(map[string]any{"error": failure.body()})
-	} else if err != nil {
-		emit(map[string]any{"error": map[string]any{"message": publicStreamError(err), "type": "api_error", "param": nil, "code": nil}})
+	if err != nil {
+		if !state.RoleSent {
+			clearSSE(w)
+			writeBackendError(w, err)
+			return
+		}
+		emit(map[string]any{"error": publicErrorObject(err)})
 	}
 	io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
-}
-
-// upstreamFailure is a Codex `error` event or failed response, shaped as the OpenAI error a Chat
-// Completions client can act on. Chat has no failed completion: before this, an upstream
-// failure such as server_is_overloaded reached clients as an empty `finish_reason: "stop"`
-// with zero usage, indistinguishable from a model that chose to say nothing.
-type upstreamFailure struct {
-	Status        int
-	Message, Type string
-	Code          string
-}
-
-func (e *upstreamFailure) Error() string { return e.Message }
-
-func (e *upstreamFailure) body() map[string]any {
-	var code any
-	if e.Code != "" {
-		code = e.Code
-	}
-	return map[string]any{"message": e.Message, "type": e.Type, "param": nil, "code": code}
-}
-
-func failureFromEvent(event map[string]any) *upstreamFailure {
-	var detail map[string]any
-	switch stringValue(event["type"]) {
-	case "error":
-		if detail = mapAny(event["error"]); detail == nil {
-			detail = event
-		}
-	case "response.failed":
-		detail = mapAny(mapAny(event["response"])["error"])
-	default:
-		return nil
-	}
-	return failureFromDetail(detail)
-}
-
-func failureFromDetail(detail map[string]any) *upstreamFailure {
-	code := stringValue(detail["code"])
-	message := stringValue(detail["message"])
-	if message == "" {
-		message = "Codex backend response failed."
-	}
-	status := http.StatusBadGateway
-	switch code {
-	case "server_is_overloaded", "slow_down":
-		status = http.StatusServiceUnavailable
-	case "rate_limit_exceeded", "usage_limit_reached", "usage_not_included":
-		status = http.StatusTooManyRequests
-	}
-	typ := stringValue(detail["type"])
-	if typ == "" || typ == "error" {
-		typ = "api_error"
-	}
-	return &upstreamFailure{Status: status, Message: redactSensitive(message), Type: typ, Code: code}
 }
 
 type chatStreamState struct {
@@ -829,6 +794,15 @@ type chatStreamState struct {
 	Model             string
 	ChoiceCount       int
 	RoleSent, SawText bool
+}
+
+// chatStreamToolCall tracks one function_call output item. index numbers tool
+// calls contiguously from 0 for clients, while output_index also counts message
+// and reasoning items.
+type chatStreamToolCall struct {
+	index   int
+	started bool
+	sent    string
 }
 
 func (s *chatStreamState) update(resp map[string]any) {
@@ -865,22 +839,32 @@ func chatChunk(s chatStreamState, delta map[string]any, finish *string, choices 
 	}
 	return result
 }
-func toolDelta(item map[string]any, index int, args string, identity, legacy bool) map[string]any {
+func argumentsDelta(index int, args string, legacy bool) map[string]any {
 	if legacy {
-		fn := map[string]any{"arguments": args}
-		if identity {
-			fn["name"] = stringValue(item["name"])
-		}
+		return map[string]any{"function_call": map[string]any{"arguments": args}}
+	}
+	return map[string]any{"tool_calls": []any{map[string]any{"index": index, "function": map[string]any{"arguments": args}}}}
+}
+
+func toolDelta(item map[string]any, index int, args string, legacy bool) map[string]any {
+	fn := map[string]any{"name": stringValue(item["name"]), "arguments": args}
+	if legacy {
 		return map[string]any{"function_call": fn}
 	}
-	fn := map[string]any{"arguments": args}
-	call := map[string]any{"index": index, "function": fn}
-	if identity {
-		fn["name"] = stringValue(item["name"])
-		call["id"] = stringValue(valueOr(item["call_id"], valueOr(item["id"], fmt.Sprintf("call_%d", index))))
-		call["type"] = "function"
+	return map[string]any{"tool_calls": []any{map[string]any{
+		"index":    index,
+		"id":       stringValue(valueOr(item["call_id"], valueOr(item["id"], fmt.Sprintf("call_%d", index)))),
+		"type":     "function",
+		"function": fn,
+	}}}
+}
+
+func equivalentJSON(left, right string) bool {
+	var leftValue, rightValue any
+	if json.Unmarshal([]byte(left), &leftValue) != nil || json.Unmarshal([]byte(right), &rightValue) != nil {
+		return false
 	}
-	return map[string]any{"tool_calls": []any{call}}
+	return reflect.DeepEqual(leftValue, rightValue)
 }
 
 func (s *server) listChats(w http.ResponseWriter, r *http.Request) {
@@ -979,6 +963,9 @@ func (s *server) images(w http.ResponseWriter, r *http.Request, edit bool) {
 	for i := 0; i < count; i++ {
 		payload := imageResponsePayload(body, imageDriverModel(body, s.cfg.Model))
 		resp, err := s.backend.collect(r.Context(), payload)
+		if err == nil {
+			err = failedResponseError(resp)
+		}
 		if err != nil {
 			writeBackendError(w, err)
 			return
@@ -1041,7 +1028,11 @@ func (s *server) streamImages(w http.ResponseWriter, r *http.Request, body map[s
 			if image := imageFromItem(mapAny(event["item"])); image != nil {
 				final = imageStreamEvent(prefix+".completed", metadata, created, stringValue(image["b64_json"]), event)
 			}
-		case "response.completed", "response.incomplete", "response.failed":
+		case "error":
+			return responseFailure(errorEventDetail(event))
+		case "response.failed":
+			return responseFailure(failureDetail(mapAny(event["response"])["error"]))
+		case "response.completed", "response.incomplete":
 			response := mapAny(event["response"])
 			if response == nil {
 				return nil
@@ -1062,7 +1053,9 @@ func (s *server) streamImages(w http.ResponseWriter, r *http.Request, body map[s
 	})
 	switch {
 	case err != nil:
-		emit(map[string]any{"type": "error", "code": nil, "message": publicStreamError(err), "param": nil})
+		failure := publicErrorObject(err)
+		failure["type"] = "error"
+		emit(failure)
 	case final == nil:
 		emit(map[string]any{
 			"type": "error", "code": nil, "param": nil,
@@ -1170,28 +1163,40 @@ func writeError(w http.ResponseWriter, status int, message, typ string, param *s
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": typ, "param": p, "code": code}})
 }
 func writeBackendError(w http.ResponseWriter, err error) {
-	var failure *upstreamFailure
-	if errors.As(err, &failure) {
-		writeJSON(w, failure.Status, map[string]any{"error": failure.body()})
-		return
-	}
 	var be *backendError
 	if errors.As(err, &be) {
-		writeError(w, be.Status, be.Message, "api_error", nil, nil)
+		var failure *responseFailureError
+		if errors.As(err, &failure) && failure.RetryAfter != "" {
+			w.Header().Set("Retry-After", failure.RetryAfter)
+		}
+		writeJSON(w, be.Status, map[string]any{"error": publicErrorObject(err)})
 	} else {
 		writeError(w, 500, "Internal server error.", "api_error", nil, nil)
 	}
 }
-func publicStreamError(err error) string {
-	var failure *upstreamFailure
+func publicErrorObject(err error) map[string]any {
+	result := map[string]any{"message": publicStreamError(err), "type": "api_error", "param": nil, "code": nil}
+	var failure *responseFailureError
 	if errors.As(err, &failure) {
-		return failure.Message
+		result["type"] = failure.Type
+		result["param"] = failure.Param
+		if failure.Code != "" {
+			result["code"] = failure.Code
+		}
 	}
+	return result
+}
+func publicStreamError(err error) string {
 	var be *backendError
 	if errors.As(err, &be) {
 		return be.Message
 	}
 	return "Internal server error."
+}
+func clearSSE(w http.ResponseWriter) {
+	for _, header := range []string{"Content-Type", "Cache-Control", "Connection", "X-Accel-Buffering"} {
+		w.Header().Del(header)
+	}
 }
 func setSSE(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")

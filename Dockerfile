@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build the production server as a static Go executable.
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS server-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm@sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9 AS server-builder
 
 WORKDIR /src
 
@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Login helper stage: bundles the official Codex CLI so `codex login` can run
 # in a container without Codex installed on the host. Not part of the default
 # build; used by the `codex-login` compose service (or --target login).
-FROM node:22-slim AS login
+FROM node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS login
 
 ARG CODEX_VERSION=latest
 # ca-certificates is required, not optional: the Codex CLI is a Rust binary with
@@ -32,7 +32,7 @@ ARG CODEX_VERSION=latest
 # (https://auth.openai.com/api/accounts/deviceauth/usercode)" — which reads like
 # an outage rather than a missing dependency.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends socat ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates socat \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g "@openai/codex@${CODEX_VERSION}"
 
@@ -54,7 +54,7 @@ CMD ["login"]
 # Debian rather than Alpine on purpose: the Codex CLI ships a glibc-linked Rust
 # binary, so it does not run on musl. The Go server is static (CGO_ENABLED=0) and
 # runs on either, so the base is chosen by the CLI's constraint alone.
-FROM node:22-slim AS runtime-ui
+FROM node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS runtime-ui
 
 ARG VERSION=dev
 ARG REVISION=unknown
@@ -100,7 +100,7 @@ CMD ["serve"]
 
 # Runtime stage: only the static Go server, CA roots, and Alpine's BusyBox tools.
 # Keep this stage last so a plain `docker build` produces the server image.
-FROM alpine:3.22 AS runtime
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS runtime
 
 ARG VERSION=dev
 ARG REVISION=unknown
@@ -111,7 +111,7 @@ LABEL org.opencontainers.image.title="openai-api-server-via-codex" \
     org.opencontainers.image.revision="${REVISION}" \
     org.opencontainers.image.licenses="Apache-2.0"
 
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache 'ca-certificates>=20261020-r0' \
     && addgroup -g 1000 app \
     && adduser -D -u 1000 -G app app \
     && mkdir -p /home/app/.codex \
