@@ -56,7 +56,7 @@ $ docker pull ghcr.io/hotchpotch/openai-api-server-via-codex:latest
 ```
 
 `latest` tracks the newest stable release. Every release also has its exact Git
-tag, for example `ghcr.io/hotchpotch/openai-api-server-via-codex:v0.2.1`.
+tag, for example `ghcr.io/hotchpotch/openai-api-server-via-codex:v0.3.0`.
 Prereleases publish only their exact tag and never replace `latest`.
 
 Use the published image with the repository's Compose configuration without
@@ -75,6 +75,25 @@ $ docker run --rm -p 127.0.0.1:18080:18080 \
     -v ~/.codex:/home/app/.codex \
     ghcr.io/hotchpotch/openai-api-server-via-codex:latest
 ```
+
+## Refresh images after CA security updates
+
+For the October 2026 eMudhra CA incident, source builds require Go 1.27.3
+and the runtime installs Alpine `ca-certificates` 20261020-r0 or newer.
+The login helper uses Node.js 22.23.4 with updated CA certificates.
+
+Refresh base images and bypass cached package-install layers when rebuilding:
+
+```console
+$ docker compose build --pull --no-cache openai-api-server-via-codex codex-login
+$ docker compose up --no-build -d openai-api-server-via-codex
+```
+
+For published images, pull a release containing these fixes and recreate the
+server using the commands above under [Published image](#published-image).
+Updating a host toolchain or pulling an image does not replace a running
+container. The release workflow also refreshes base images and rebuilds the
+runtime package-install layer on every container publication.
 
 ## Getting a Codex login
 
@@ -164,7 +183,8 @@ block of `docker-compose.yml`, for example:
 - `OPENAI_VIA_CODEX_DEFAULT_MODEL` — override the default model used when a
   request omits one (`gpt-5.6-luna`).
 - `OPENAI_VIA_CODEX_TIMEOUT`, `OPENAI_VIA_CODEX_MAX_STORED_ITEMS`,
-  `OPENAI_VIA_CODEX_MAX_CONCURRENT_REQUESTS` — backend timeout and bounds.
+  `OPENAI_VIA_CODEX_MAX_CONCURRENT_REQUESTS`, `OPENAI_VIA_CODEX_MAX_RETRIES` —
+  backend timeout, bounds, and retries.
 
 Every API request emits a redacted completion line visible through
 `docker compose logs`; routine healthcheck probes stay quiet. Verbose mode adds

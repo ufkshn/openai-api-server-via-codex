@@ -1,5 +1,7 @@
 # HEAD
 
+## Features
+
 - Added `POST /v1/images/edits` support, compatible with
   `client.images.edit(...)`. Multipart uploads are inlined as data URLs and sent
   to Codex as the hosted `image_generation` tool with `action="edit"`, including
@@ -13,3 +15,9 @@
   `n=1`, and `partial_images` accepts `0`-`3` as a hint; Codex decides how many
   previews it actually sends, so only the completed event is guaranteed.
 - Added `input_fidelity` passthrough for image generations and edits.
+
+## Distribution
+
+- Build container images from digest-pinned Go, Node.js, and Alpine base
+  images, and pin release workflow actions, including transitive action
+  dependencies, through a GitHub Actions lockfile.

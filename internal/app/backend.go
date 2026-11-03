@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,9 +26,10 @@ const maxSSEEventBytes = 128 << 20
 const replayBodyMemoryLimit = 1 << 20
 
 type backend struct {
-	cfg    config
-	client *http.Client
-	pool   *accountPool
+	cfg          config
+	client       *http.Client
+	streamClient *http.Client
+	pool         *accountPool
 }
 type backendError struct {
 	Status  int
@@ -34,12 +38,173 @@ type backendError struct {
 
 func (e *backendError) Error() string { return e.Message }
 
+const (
+	retryBaseDelay = 200 * time.Millisecond
+	// A longer server-advised wait is left to the client through Retry-After.
+	maxRetryAdvice = 30 * time.Second
+)
+
+var (
+	errSSELimit    = errors.New("Codex SSE size limit exceeded")
+	errStreamIdle  = errors.New("Codex stream idle timeout")
+	errRetryStream = errors.New("retry Codex stream")
+)
+
+// responseFailureError is a failure Codex reported through a response status or
+// an event in a 2xx stream.
+type responseFailureError struct {
+	backendError
+	Type, Code, RetryAfter string
+	Param                  any
+}
+
+func (e *responseFailureError) Unwrap() error { return &e.backendError }
+
+// responseFailure builds and logs the client error for a failure detail. The code
+// is logged because a stream may have already reported HTTP 200.
+func responseFailure(detail map[string]any) error {
+	err := newResponseFailure(detail)
+	var failure *responseFailureError
+	if errors.As(err, &failure) {
+		log.Printf("codex.response.failed code=%s status=%d", failure.Code, failure.Status)
+	}
+	return err
+}
+
+// newResponseFailure builds the client error for a failure detail from Codex.
+// Text fields are redacted.
+func newResponseFailure(detail map[string]any) error {
+	code := redactSensitive(stringValue(detail["code"]))
+	upstreamType := redactSensitive(stringValue(detail["type"]))
+	if code == "" && responseFailureStatus(upstreamType) == http.StatusTooManyRequests {
+		// Usage errors name themselves in type rather than code.
+		code = upstreamType
+	}
+	message := failureFallbackMessages[code]
+	if message == "" {
+		message = "Codex backend response failed."
+	}
+	if text := strings.TrimSpace(stringValue(detail["message"])); text != "" {
+		message = redactSensitive(text)
+	}
+	status := responseFailureStatus(code)
+	if explicit := intValue(detail["status"]); explicit >= 400 && explicit < 600 {
+		status = explicit
+	}
+	errorType := upstreamType
+	if errorType == "" {
+		switch status {
+		case http.StatusBadRequest, http.StatusNotFound:
+			errorType = "invalid_request_error"
+		case http.StatusUnauthorized:
+			errorType = "authentication_error"
+		case http.StatusTooManyRequests:
+			errorType = "rate_limit_error"
+		default:
+			errorType = "api_error"
+		}
+	}
+	var param any
+	if text := stringValue(detail["param"]); text != "" {
+		param = redactSensitive(text)
+	}
+	return &responseFailureError{backendError{status, message}, errorType, code, retryAfterAdvice(detail), param}
+}
+
+var failureFallbackMessages = map[string]string{
+	"invalid_prompt":                "Invalid request.",
+	"cyber_policy":                  "This request has been flagged for possible cybersecurity risk.",
+	"bio_policy":                    "This content was flagged for possible biological risk.",
+	"misalignment_policy_violation": "This request was blocked due to a misalignment policy violation.",
+}
+
+func responseFailureStatus(code string) int {
+	switch code {
+	case "invalid_api_key":
+		return http.StatusUnauthorized
+	case "model_not_found":
+		return http.StatusNotFound
+	case "rate_limit_exceeded", "insufficient_quota", "usage_limit_reached", "usage_not_included",
+		"credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded",
+		"organization_usage_limit_exceeded", "flex_unavailable":
+		return http.StatusTooManyRequests
+	case "server_is_overloaded", "slow_down", "policy_capacity_unavailable":
+		return http.StatusServiceUnavailable
+	case "context_length_exceeded", "unsupported_parameter", "content_filter",
+		"cyber_policy", "bio_policy", "misalignment_policy_violation",
+		"audio_too_large", "audio_too_short", "missing_audio_sample_rate":
+		return http.StatusBadRequest
+	}
+	if strings.HasPrefix(code, "invalid_") {
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
+}
+
+// retryAfterAdvice returns a valid Retry-After value from a failure's headers.
+func retryAfterAdvice(detail map[string]any) string {
+	for key, value := range mapAny(detail["headers"]) {
+		if strings.EqualFold(key, "retry-after") {
+			advice := strings.TrimSpace(stringValue(value))
+			if _, ok := parseRetryAfter(advice); ok {
+				return advice
+			}
+		}
+	}
+	return ""
+}
+
+func parseRetryAfter(value string) (time.Duration, bool) {
+	if seconds, err := strconv.ParseFloat(value, 64); err == nil {
+		return time.Duration(seconds * float64(time.Second)), seconds >= 0 && seconds <= math.MaxInt32
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		return max(time.Until(at), 0), true
+	}
+	return 0, false
+}
+
+// failureDetail reads an upstream error value, which is an object or a message.
+func failureDetail(value any) map[string]any {
+	if detail := mapAny(value); detail != nil {
+		return detail
+	}
+	if text := stringValue(value); text != "" {
+		return map[string]any{"message": text}
+	}
+	return nil
+}
+
+// errorEventDetail reads an error event, which holds its fields either directly
+// or under "error", and may give an HTTP status beside them.
+func errorEventDetail(event map[string]any) map[string]any {
+	detail := cloneMap(failureDetail(event["error"]))
+	if detail == nil {
+		detail = cloneMap(event)
+		delete(detail, "type")
+	}
+	if detail["status"] == nil {
+		detail["status"] = event["status"]
+	}
+	return detail
+}
+
+// failedResponseError returns the client error for a response that failed.
+func failedResponseError(response map[string]any) error {
+	if stringValue(response["status"]) != "failed" {
+		return nil
+	}
+	return responseFailure(failureDetail(response["error"]))
+}
+
 func newBackend(cfg config) *backend {
 	client := &http.Client{Timeout: cfg.Timeout}
 	return &backend{
 		cfg:    cfg,
 		client: client,
-		pool:   newAccountPool(cfg.AuthJSON, &http.Client{Timeout: authRefreshTimeout}),
+		// stream applies cfg.Timeout between events, so a long response can finish.
+		streamClient: &http.Client{},
+		pool:         newAccountPool(cfg.AuthJSON, &http.Client{Timeout: authRefreshTimeout}),
 	}
 }
 
@@ -92,6 +257,12 @@ func (b *backend) headersWithTier(cred credentials, stream bool, requestID, serv
 // to the next one. Only when no account is left is that refusal returned. The
 // returned response's Body releases the account when closed.
 func (b *backend) doAuthenticated(hints routeHints, makeRequest func(*accountLease) (*http.Request, error)) (*http.Response, *accountLease, error) {
+	return b.doAuthenticatedWith(b.client, hints, makeRequest)
+}
+
+// doAuthenticatedWith is doAuthenticated on a chosen client: streams use one
+// without a whole-request timeout, because their timeout runs between events.
+func (b *backend) doAuthenticatedWith(client *http.Client, hints routeHints, makeRequest func(*accountLease) (*http.Request, error)) (*http.Response, *accountLease, error) {
 	exclude := map[string]bool{}
 	var refused *http.Response
 	var refusedLease *accountLease
@@ -107,7 +278,7 @@ func (b *backend) doAuthenticated(hints routeHints, makeRequest func(*accountLea
 			}
 			return nil, nil, poolError("request", err)
 		}
-		resp, err := b.sendOnAccount(lease, makeRequest)
+		resp, err := b.sendOnAccount(client, lease, makeRequest)
 		if err != nil {
 			lease.release()
 			var credErr *accountCredentialError
@@ -127,7 +298,7 @@ func (b *backend) doAuthenticated(hints routeHints, makeRequest func(*accountLea
 			if body := bufferedBody(resp); encryptedContentRejected(body) {
 				log.Printf("codex.account.reasoning_rejected account=%s action=resend_without_reasoning", lease.id())
 				lease.pinMissed = true
-				resp, err = b.sendOnAccount(lease, makeRequest)
+				resp, err = b.sendOnAccount(client, lease, makeRequest)
 				if err != nil {
 					lease.release()
 					return nil, nil, err
@@ -153,13 +324,13 @@ func (b *backend) doAuthenticated(hints routeHints, makeRequest func(*accountLea
 
 // sendOnAccount keeps the single-account rule: a 401 reloads the credentials
 // (someone may have rewritten auth.json) and retries once.
-func (b *backend) sendOnAccount(lease *accountLease, makeRequest func(*accountLease) (*http.Request, error)) (*http.Response, error) {
+func (b *backend) sendOnAccount(client *http.Client, lease *accountLease, makeRequest func(*accountLease) (*http.Request, error)) (*http.Response, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		req, err := makeRequest(lease)
 		if err != nil {
 			return nil, err
 		}
-		resp, err := b.client.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
 		}
@@ -254,6 +425,11 @@ func normalizeCodexPayload(prepared map[string]any, dropParams []string) map[str
 		delete(prepared, name)
 	}
 	delete(prepared, "max_output_tokens")
+	for _, item := range sliceAny(prepared["input"]) {
+		for _, part := range sliceAny(mapAny(item)["content"]) {
+			delete(mapAny(part), "prompt_cache_breakpoint")
+		}
+	}
 	prepared["stream"], prepared["store"] = true, false
 	setDefault(prepared, "tool_choice", "auto")
 	setDefault(prepared, "parallel_tool_calls", true)
@@ -277,7 +453,140 @@ func normalizeCodexPayload(prepared map[string]any, dropParams []string) map[str
 	return prepared
 }
 
+// stream delivers Codex events to fn, retrying transient failures while no output
+// has reached fn. Lifecycle events wait until the attempt produces output, so a
+// client never sees events from an abandoned attempt.
 func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(map[string]any) error) error {
+	return b.streamWithRetries(ctx, payload, false, fn)
+}
+
+// streamWithRetries holds every event until the terminal one when holdOutput is
+// set, for a caller that shows the client nothing until the response is complete.
+func (b *backend) streamWithRetries(ctx context.Context, payload map[string]any, holdOutput bool, fn func(map[string]any) error) error {
+	for attempt := 0; ; attempt++ {
+		var held []map[string]any
+		var retryable, pending error
+		// The final attempt has nothing to hide, so it streams without delay.
+		committed := attempt >= b.cfg.MaxRetries
+		commit := func() error {
+			committed = true
+			for _, event := range held {
+				if err := fn(event); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		err := b.streamOnce(ctx, payload, func(event map[string]any) error {
+			if committed {
+				return fn(event)
+			}
+			typ := stringValue(event["type"])
+			switch {
+			case typ == "error":
+				// A response.failed that follows has the authoritative code.
+				pending = eventFailure(event)
+				held = append(held, event)
+				return nil
+			case typ == "response.failed":
+				failure := eventFailure(event)
+				if _, ok := b.retryDelay(failure, attempt); ok {
+					retryable = failure
+					return errRetryStream
+				}
+			case typ == "response.completed" || typ == "response.incomplete":
+			case holdOutput || isLifecycleEvent(typ):
+				held = append(held, event)
+				return nil
+			}
+			if err := commit(); err != nil {
+				return err
+			}
+			return fn(event)
+		})
+		if committed {
+			return err
+		}
+		failure := err
+		switch {
+		case errors.Is(err, errRetryStream):
+			failure = retryable
+		case err == nil:
+			failure = pending
+		}
+		delay, ok := b.retryDelay(failure, attempt)
+		if !ok || ctx.Err() != nil {
+			if commitErr := commit(); commitErr != nil {
+				return commitErr
+			}
+			return failure
+		}
+		log.Printf("codex.stream.retry attempt=%d max_retries=%d delay_ms=%d code=%s", attempt+1, b.cfg.MaxRetries, delay.Milliseconds(), failureCode(failure))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+}
+
+func isLifecycleEvent(eventType string) bool {
+	switch eventType {
+	case "response.created", "response.queued", "response.in_progress", "response.metadata", "codex.response.metadata":
+		return true
+	}
+	return false
+}
+
+func failureCode(err error) string {
+	var failure *responseFailureError
+	if errors.As(err, &failure) {
+		return failure.Code
+	}
+	return ""
+}
+
+func eventFailure(event map[string]any) error {
+	if stringValue(event["type"]) == "error" {
+		return newResponseFailure(errorEventDetail(event))
+	}
+	return newResponseFailure(failureDetail(mapAny(event["response"])["error"]))
+}
+
+// retryDelay returns the wait before retrying after err, if err is transient and
+// retries remain. Only a backend-reported failure can be transient. A stalled
+// backend is not retried, because each attempt would wait out the whole timeout.
+func (b *backend) retryDelay(err error, attempt int) (time.Duration, bool) {
+	var failure *backendError
+	if attempt >= b.cfg.MaxRetries || !errors.As(err, &failure) {
+		return 0, false
+	}
+	var code, advice string
+	var reported *responseFailureError
+	if errors.As(err, &reported) {
+		code, advice = reported.Code, reported.RetryAfter
+	}
+	var retry bool
+	switch {
+	case failure.Status == http.StatusTooManyRequests:
+		retry = code == "rate_limit_exceeded" || (code == "" && advice != "")
+	case code == "server_is_overloaded" || code == "policy_capacity_unavailable":
+		retry = advice != ""
+	default:
+		retry = failure.Status >= 500 && failure.Status != http.StatusGatewayTimeout
+	}
+	if !retry {
+		return 0, false
+	}
+	if advice != "" {
+		delay, _ := parseRetryAfter(advice)
+		return delay, delay <= maxRetryAdvice
+	}
+	delay := min(b.cfg.retryBaseDelay<<min(attempt, 8), maxRetryAdvice)
+	return time.Duration(float64(delay) * (0.9 + rand.Float64()*0.2)), true
+}
+
+func (b *backend) streamOnce(ctx context.Context, payload map[string]any, fn func(map[string]any) error) error {
 	b.debugf("codex.stream.start model=%s endpoint=%s/responses", stringValue(payload["model"]), b.cfg.BackendURL)
 	prepared := prepareCodexPayload(payload, b.cfg.DropParams)
 	// Same rule as the tier: read from prepared so drop_params still governs it. The body copy is
@@ -286,8 +595,18 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 	fastMode := boolValue(prepared["fast_mode"])
 	delete(prepared, "fast_mode")
 	body, _ := json.Marshal(prepared)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	idle := time.AfterFunc(b.cfg.Timeout, func() { cancel(errStreamIdle) })
+	defer idle.Stop()
+	idleError := func() error {
+		if errors.Is(context.Cause(ctx), errStreamIdle) {
+			return &backendError{http.StatusGatewayTimeout, "Codex backend stream timed out."}
+		}
+		return nil
+	}
 	var stripped []byte
-	resp, lease, err := b.doAuthenticated(hintsForPayload(prepared), func(lease *accountLease) (*http.Request, error) {
+	resp, lease, err := b.doAuthenticatedWith(b.streamClient, hintsForPayload(prepared), func(lease *accountLease) (*http.Request, error) {
 		requestBody := body
 		if lease.pinMissed {
 			if stripped == nil {
@@ -310,6 +629,9 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 			b.debugf("codex.stream.auth_error message=%s", redactSensitive(err.Error()))
 			return err
 		}
+		if err := idleError(); err != nil {
+			return err
+		}
 		return &backendError{502, "Codex backend request failed."}
 	}
 	defer resp.Body.Close()
@@ -321,6 +643,7 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	var data strings.Builder
 	events := 0
+	terminal, finished := false, false
 	flush := func() error {
 		if data.Len() == 0 {
 			return nil
@@ -337,24 +660,44 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 		normalizeBackendEvent(event)
 		events++
 		switch event["type"] {
+		case "error":
+			terminal = true
+		case "response.failed":
+			terminal, finished = true, true
+		case "response.completed", "response.incomplete":
+			if mapAny(event["response"]) != nil {
+				terminal, finished = true, true
+			}
 		case "response.output_item.done":
 			b.pool.rememberOutput(account, mapAny(event["item"]))
 		case "codex.rate_limits":
 			b.pool.observeRateLimitEvent(account, event)
 		}
+		// A slow client must not count as an idle backend.
+		idle.Stop()
+		defer idle.Reset(b.cfg.Timeout)
 		return fn(event)
 	}
 	for {
 		line, readErr := readSSELine(reader, maxSSEEventBytes)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			b.debugf("codex.stream.error message=%s", redactSensitive(readErr.Error()))
-			return readErr
+			if terminal {
+				return nil
+			}
+			if err := idleError(); err != nil {
+				return err
+			}
+			if errors.Is(readErr, errSSELimit) {
+				return readErr
+			}
+			return &backendError{502, "Codex backend stream failed."}
 		}
 		if line == "" {
 			if err := flush(); err != nil {
 				return err
 			}
-			if errors.Is(readErr, io.EOF) {
+			if finished || errors.Is(readErr, io.EOF) {
 				break
 			}
 			continue
@@ -362,7 +705,7 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 		if strings.HasPrefix(line, "data:") {
 			part := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if data.Len()+len(part)+1 > maxSSEEventBytes {
-				return fmt.Errorf("Codex SSE event exceeds %d bytes", maxSSEEventBytes)
+				return fmt.Errorf("%w: event exceeds %d bytes", errSSELimit, maxSSEEventBytes)
 			}
 			if data.Len() > 0 {
 				data.WriteByte('\n')
@@ -377,6 +720,9 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 		return err
 	}
 	b.debugf("codex.stream.end events=%d", events)
+	if !terminal {
+		return &backendError{502, "Codex stream closed before the response completed."}
+	}
 	return nil
 }
 
@@ -385,7 +731,7 @@ func readSSELine(reader *bufio.Reader, limit int) (string, error) {
 	for {
 		fragment, err := reader.ReadSlice('\n')
 		if len(line)+len(fragment) > limit {
-			return "", fmt.Errorf("Codex SSE line exceeds %d bytes", limit)
+			return "", fmt.Errorf("%w: line exceeds %d bytes", errSSELimit, limit)
 		}
 		line = append(line, fragment...)
 		if errors.Is(err, bufio.ErrBufferFull) {
@@ -426,29 +772,25 @@ func validResponseStatus(status string) bool {
 func (b *backend) collect(ctx context.Context, payload map[string]any) (map[string]any, error) {
 	var completed map[string]any
 	var output []any
-	var text strings.Builder
-	var responseID string
-	var upstreamErr *upstreamFailure
-	err := b.stream(ctx, payload, func(event map[string]any) error {
+	var failure map[string]any
+	err := b.streamWithRetries(ctx, payload, true, func(event map[string]any) error {
 		switch event["type"] {
-		case "error":
-			upstreamErr = failureFromEvent(event)
-		case "response.created":
-			if r := mapAny(event["response"]); r != nil {
-				responseID = stringValue(r["id"])
-			}
-		case "response.output_text.delta":
-			text.WriteString(stringValue(event["delta"]))
 		case "response.output_item.done":
 			if item := mapAny(event["item"]); item != nil {
 				output = append(output, item)
 			}
+		case "error":
+			failure = errorEventDetail(event)
 		case "response.completed", "response.incomplete":
 			completed = cloneMap(mapAny(event["response"]))
 		case "response.failed":
 			completed = cloneMap(mapAny(event["response"]))
 			if completed == nil {
-				return &backendError{502, "Codex backend response failed."}
+				return responseFailure(failure)
+			}
+			completed["status"] = "failed"
+			if completed["error"] == nil && failure != nil {
+				completed["error"] = failure
 			}
 		}
 		return nil
@@ -456,20 +798,13 @@ func (b *backend) collect(ctx context.Context, payload map[string]any) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	if completed == nil && upstreamErr != nil {
-		// Without a terminal response the text fallback below would report an empty success.
-		return nil, upstreamErr
-	}
 	if completed != nil {
 		if len(sliceAny(completed["output"])) == 0 && len(output) > 0 {
 			completed["output"] = output
 		}
 		return completed, nil
 	}
-	if responseID == "" {
-		responseID = newID("resp")
-	}
-	return map[string]any{"id": responseID, "object": "response", "created_at": nowFloat(), "status": "completed", "model": payload["model"], "output": []any{outputMessage(text.String())}, "parallel_tool_calls": true, "tool_choice": valueOr(payload["tool_choice"], "auto"), "tools": sliceAny(payload["tools"])}, nil
+	return nil, responseFailure(failure)
 }
 
 func (b *backend) listModels(ctx context.Context) []string {
@@ -611,13 +946,22 @@ func (b *backend) transcribe(ctx context.Context, headers http.Header, body io.R
 func decodeBackendError(resp *http.Response) error {
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var doc map[string]any
-	message := resp.Status
+	detail := map[string]any{}
 	if json.Unmarshal(data, &doc) == nil {
-		if e := mapAny(doc["error"]); e != nil && stringValue(e["message"]) != "" {
-			message = stringValue(e["message"])
+		upstream := failureDetail(doc["error"])
+		if upstream == nil {
+			upstream = failureDetail(doc["detail"])
+		}
+		if upstream != nil {
+			detail = cloneMap(upstream)
 		}
 	}
-	return &backendError{resp.StatusCode, redactSensitive(message)}
+	if stringValue(detail["message"]) == "" && failureFallbackMessages[stringValue(detail["code"])] == "" {
+		detail["message"] = resp.Status
+	}
+	detail["status"] = resp.StatusCode
+	detail["headers"] = map[string]any{"retry-after": resp.Header.Get("Retry-After")}
+	return responseFailure(detail)
 }
 func invalidProxyPath(path string) bool {
 	_, err := cleanProxyPath(path)

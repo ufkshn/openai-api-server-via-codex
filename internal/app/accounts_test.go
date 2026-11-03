@@ -55,6 +55,9 @@ func (f *poolFixture) backend(upstream *httptest.Server) *backend {
 	cfg := defaultConfig()
 	cfg.BackendURL = upstream.URL
 	cfg.AuthJSON = f.authJSON()
+	// The pool is measured on its own: the stream retry would otherwise turn a
+	// refusal the test expects into a later success.
+	cfg.MaxRetries = 0
 	return newBackend(cfg)
 }
 
@@ -191,6 +194,32 @@ func TestPoolStillTriesACoolingAccountWhenItIsTheOnlyOne(t *testing.T) {
 	}
 	if err := streamOnce(b, nil); err != nil {
 		t.Fatalf("second request = %v", err)
+	}
+}
+
+// With stream retries on, a lone account refused with 429 is tried again after the
+// backoff, so the client gets the answer instead of the refusal.
+func TestPoolRetriesALoneRateLimitedAccountWhenRetriesAreOn(t *testing.T) {
+	f := newPoolFixture(t, defaultAccountID)
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"code":"rate_limit_exceeded","message":"slow down"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, completedSSE)
+	}))
+	defer upstream.Close()
+	b := f.backend(upstream)
+	b.cfg.MaxRetries = 1
+	if err := streamOnce(b, nil); err != nil {
+		t.Fatalf("retried request = %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
 	}
 }
 

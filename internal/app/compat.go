@@ -153,6 +153,11 @@ func chatToResponse(body map[string]any, model string) map[string]any {
 	result := map[string]any{"model": valueOr(body["model"], model), "input": []any{}, "store": false}
 	var instructions []string
 	var input []any
+	// Legacy function messages carry no call id and hold one call each, so a
+	// result pairs with the latest call of that function. Clients may also send
+	// the function name as tool_call_id.
+	legacyCallCount := 0
+	latestLegacyCalls := map[string]string{}
 	for _, raw := range sliceAny(body["messages"]) {
 		msg := mapAny(raw)
 		if msg == nil {
@@ -165,10 +170,22 @@ func chatToResponse(body map[string]any, model string) map[string]any {
 				instructions = append(instructions, t)
 			}
 		case "tool", "function":
-			input = append(input, map[string]any{"type": "function_call_output", "call_id": valueOr(msg["tool_call_id"], valueOr(msg["name"], "unknown")), "output": contentText(msg["content"])})
+			callID := valueOr(msg["tool_call_id"], valueOr(msg["name"], "unknown"))
+			if latest, ok := latestLegacyCalls[stringValue(callID)]; ok {
+				callID = latest
+			}
+			input = append(input, map[string]any{"type": "function_call_output", "call_id": callID, "output": contentText(msg["content"])})
 		case "assistant":
-			if fc := mapAny(msg["function_call"]); fc != nil {
-				input = append(input, map[string]any{"type": "function_call", "call_id": valueOr(fc["name"], "function"), "name": fc["name"], "arguments": valueOr(fc["arguments"], "{}")})
+			fc := mapAny(msg["function_call"])
+			// Text precedes its calls, so a call stays adjacent to its result.
+			if text := contentText(msg["content"]); text != "" || (fc == nil && len(sliceAny(msg["tool_calls"])) == 0) {
+				input = append(input, map[string]any{"role": "assistant", "content": text})
+			}
+			if fc != nil {
+				legacyCallCount++
+				callID := fmt.Sprintf("call_legacy_%d", legacyCallCount)
+				latestLegacyCalls[stringValue(fc["name"])] = callID
+				input = append(input, map[string]any{"type": "function_call", "call_id": callID, "name": fc["name"], "arguments": valueOr(fc["arguments"], "{}")})
 			}
 			for _, tcRaw := range sliceAny(msg["tool_calls"]) {
 				tc := mapAny(tcRaw)
@@ -176,9 +193,6 @@ func chatToResponse(body map[string]any, model string) map[string]any {
 				if fn != nil {
 					input = append(input, map[string]any{"type": "function_call", "call_id": tc["id"], "name": fn["name"], "arguments": valueOr(fn["arguments"], "{}")})
 				}
-			}
-			if text := contentText(msg["content"]); text != "" || len(sliceAny(msg["tool_calls"])) == 0 {
-				input = append(input, map[string]any{"role": "assistant", "content": text})
 			}
 		case "user":
 			input = append(input, map[string]any{"role": "user", "content": chatContent(msg["content"])})
@@ -189,10 +203,17 @@ func chatToResponse(body map[string]any, model string) map[string]any {
 		result["instructions"] = "You are a helpful assistant."
 	}
 	result["input"] = input
-	for _, key := range []string{"parallel_tool_calls", "service_tier", "temperature", "top_p", "user"} {
+	// prompt_cache_key also becomes the session_id header in backend.stream; without it every
+	// Chat Completions request lands on a cold prompt cache upstream.
+	for _, key := range []string{"parallel_tool_calls", "prompt_cache_key", "service_tier", "temperature", "top_p", "user"} {
 		if body[key] != nil {
 			result[key] = body[key]
 		}
+	}
+	if usesLegacyFunctions(body) && body["parallel_tool_calls"] == nil {
+		// A legacy function_call message holds one call, so further calls
+		// would be lost.
+		result["parallel_tool_calls"] = false
 	}
 	if body["max_completion_tokens"] != nil {
 		result["max_output_tokens"] = body["max_completion_tokens"]
@@ -369,6 +390,13 @@ func responseText(response map[string]any) string {
 	return b.String()
 }
 
+func usesLegacyFunctions(body map[string]any) bool {
+	if len(sliceAny(body["tools"])) > 0 {
+		return false
+	}
+	return len(sliceAny(body["functions"])) > 0 || body["function_call"] != nil
+}
+
 func responseToChat(response map[string]any, fallback string, legacy bool, n int) map[string]any {
 	usage := mapAny(response["usage"])
 	if usage == nil {
@@ -396,19 +424,24 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 			toolCalls = append(toolCalls, map[string]any{"id": stringValue(valueOr(item["call_id"], item["id"])), "type": "function", "function": fn})
 		}
 	}
-	message := map[string]any{"role": "assistant", "content": responseText(response)}
-	if legacyCall != nil {
-		message["function_call"] = legacyCall
-	} else if len(toolCalls) > 0 {
+	text := responseText(response)
+	message := map[string]any{"role": "assistant", "content": text}
+	if text == "" && (legacyCall != nil || len(toolCalls) > 0) {
 		message["content"] = nil
-		message["tool_calls"] = toolCalls
 	}
 	finish := "stop"
-	if len(toolCalls) > 0 || legacyCall != nil {
+	if legacyCall != nil {
+		message["function_call"] = legacyCall
+		finish = "function_call"
+	} else if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
 		finish = "tool_calls"
 	}
 	if response["status"] == "incomplete" {
 		finish = "length"
+		if mapAny(response["incomplete_details"])["reason"] == "content_filter" {
+			finish = "content_filter"
+		}
 	}
 	if n < 1 {
 		n = 1
@@ -427,7 +460,20 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 	if created == 0 {
 		created = int(time.Now().Unix())
 	}
-	return map[string]any{"id": id, "object": "chat.completion", "created": created, "model": stringValue(valueOr(response["model"], fallback)), "choices": choices, "usage": map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}}
+	return map[string]any{"id": id, "object": "chat.completion", "created": created, "model": stringValue(valueOr(response["model"], fallback)), "choices": choices, "usage": chatUsage(usage, prompt, completion, total)}
+}
+
+// chatUsage carries the Responses token breakdown into its Chat Completions names, so a client
+// can see how much of the prompt was served from cache and how much output was reasoning.
+func chatUsage(usage map[string]any, prompt, completion, total int) map[string]any {
+	result := map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+	if details := mapAny(usage["input_tokens_details"]); details != nil {
+		result["prompt_tokens_details"] = map[string]any{"cached_tokens": intValue(details["cached_tokens"])}
+	}
+	if details := mapAny(usage["output_tokens_details"]); details != nil {
+		result["completion_tokens_details"] = map[string]any{"reasoning_tokens": intValue(details["reasoning_tokens"])}
+	}
+	return result
 }
 
 func responseContext(response map[string]any) []any {

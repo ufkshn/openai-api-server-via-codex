@@ -159,7 +159,11 @@ func (s *Server) responses(w http.ResponseWriter, payload map[string]any) {
 		"status": "completed", "model": payload["model"], "output": []any{item},
 		"parallel_tool_calls": true, "tool_choice": valueOr(payload["tool_choice"], "auto"),
 		"tools": slice(payload["tools"]),
-		"usage": map[string]any{"input_tokens": 3, "output_tokens": 5, "total_tokens": 8},
+		"usage": map[string]any{
+			"input_tokens": 3, "output_tokens": 5, "total_tokens": 8,
+			"input_tokens_details":  map[string]any{"cached_tokens": 2},
+			"output_tokens_details": map[string]any{"reasoning_tokens": 4},
+		},
 	}
 	created := clone(response)
 	created["status"] = "in_progress"
@@ -232,7 +236,9 @@ func (s *Server) responses(w http.ResponseWriter, payload map[string]any) {
 			// Since 2026-10-07 Codex often streams no argument deltas: the arguments
 			// arrive whole in function_call_arguments.done and output_item.done.
 			writeSSE(w, map[string]any{"type": "response.function_call_arguments.done", "sequence_number": 2, "output_index": 0, "item_id": item["id"], "arguments": `{"city":"Tokyo"}`})
-		} else {
+		} else if !strings.Contains(text, "FAKE_NO_ARGUMENT_DELTA") {
+			// The real backend sends no argument deltas for parallel tool calls;
+			// FAKE_NO_ARGUMENT_DELTA leaves the arguments to response.output_item.done.
 			writeSSE(w, map[string]any{"type": "response.function_call_arguments.delta", "sequence_number": 2, "output_index": 0, "delta": `{"city":"Tokyo"}`})
 		}
 	} else if item["type"] == "message" {
