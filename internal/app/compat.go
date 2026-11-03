@@ -203,7 +203,9 @@ func chatToResponse(body map[string]any, model string) map[string]any {
 		result["instructions"] = "You are a helpful assistant."
 	}
 	result["input"] = input
-	for _, key := range []string{"parallel_tool_calls", "service_tier", "temperature", "top_p", "user"} {
+	// prompt_cache_key also becomes the session_id header in backend.stream; without it every
+	// Chat Completions request lands on a cold prompt cache upstream.
+	for _, key := range []string{"parallel_tool_calls", "prompt_cache_key", "service_tier", "temperature", "top_p", "user"} {
 		if body[key] != nil {
 			result[key] = body[key]
 		}
@@ -458,7 +460,20 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 	if created == 0 {
 		created = int(time.Now().Unix())
 	}
-	return map[string]any{"id": id, "object": "chat.completion", "created": created, "model": stringValue(valueOr(response["model"], fallback)), "choices": choices, "usage": map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}}
+	return map[string]any{"id": id, "object": "chat.completion", "created": created, "model": stringValue(valueOr(response["model"], fallback)), "choices": choices, "usage": chatUsage(usage, prompt, completion, total)}
+}
+
+// chatUsage carries the Responses token breakdown into its Chat Completions names, so a client
+// can see how much of the prompt was served from cache and how much output was reasoning.
+func chatUsage(usage map[string]any, prompt, completion, total int) map[string]any {
+	result := map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+	if details := mapAny(usage["input_tokens_details"]); details != nil {
+		result["prompt_tokens_details"] = map[string]any{"cached_tokens": intValue(details["cached_tokens"])}
+	}
+	if details := mapAny(usage["output_tokens_details"]); details != nil {
+		result["completion_tokens_details"] = map[string]any{"reasoning_tokens": intValue(details["reasoning_tokens"])}
+	}
+	return result
 }
 
 func responseContext(response map[string]any) []any {

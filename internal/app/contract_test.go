@@ -1309,6 +1309,56 @@ func TestGoHTTPContractChatSurfacesUpstreamFailure(t *testing.T) {
 	environment.json(t, http.MethodPost, "/v1/chat/completions", chat("FAKE_RESPONSE_FAILED", false), http.StatusBadGateway)
 }
 
+// Chat Completions reaches Codex as a Responses request: the client's prompt_cache_key must
+// survive that translation (body and session_id header) or every step misses the prompt cache,
+// and the cached/reasoning breakdown must come back under the Chat Completions usage names.
+func TestGoHTTPContractChatForwardsPromptCacheKeyAndReportsCachedTokens(t *testing.T) {
+	environment := newContractEnvironment(t, nil)
+	for _, stream := range []bool{false, true} {
+		payload := map[string]any{
+			"model": "gpt-6-sol", "stream": stream, "stream_options": map[string]any{"include_usage": true},
+			"prompt_cache_key": "ask-gm-thread-42", "tool_choice": "none",
+			"messages": []any{map[string]any{"role": "user", "content": "GO-CHAT-CACHE"}},
+			"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+				"name": "lookup_weather", "parameters": map[string]any{"type": "object"},
+			}}},
+		}
+		response, data := environment.request(t, http.MethodPost, "/v1/chat/completions", payload)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("stream=%t status = %d; body=%s", stream, response.StatusCode, data)
+		}
+		upstream := environment.upstream.LastResponseRequest(t)
+		if upstream.JSON["prompt_cache_key"] != "ask-gm-thread-42" {
+			t.Fatalf("stream=%t upstream prompt_cache_key = %#v", stream, upstream.JSON["prompt_cache_key"])
+		}
+		if upstream.Headers.Get("session_id") != "ask-gm-thread-42" || upstream.Headers.Get("x-client-request-id") != "ask-gm-thread-42" {
+			t.Fatalf("stream=%t upstream headers = %#v", stream, upstream.Headers)
+		}
+		if upstream.JSON["tool_choice"] != "none" {
+			t.Fatalf("stream=%t upstream tool_choice = %#v", stream, upstream.JSON["tool_choice"])
+		}
+
+		var usage map[string]any
+		if stream {
+			for _, event := range parseSSE(t, data) {
+				if u := mapAny(event["usage"]); u != nil {
+					usage = u
+				}
+			}
+		} else {
+			var document map[string]any
+			if err := json.Unmarshal(data, &document); err != nil {
+				t.Fatal(err)
+			}
+			usage = mapAny(document["usage"])
+		}
+		if intValue(mapAny(usage["prompt_tokens_details"])["cached_tokens"]) != 2 ||
+			intValue(mapAny(usage["completion_tokens_details"])["reasoning_tokens"]) != 4 {
+			t.Fatalf("stream=%t usage = %#v; body=%s", stream, usage, data)
+		}
+	}
+}
+
 func TestGoHTTPContractChatStreamsToolArgumentsSentWithoutDeltas(t *testing.T) {
 	environment := newContractEnvironment(t, nil)
 	for _, trigger := range []string{"FAKE_ARGS_DONE_ONLY", "streamed deltas"} {

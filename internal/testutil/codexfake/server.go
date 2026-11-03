@@ -159,7 +159,11 @@ func (s *Server) responses(w http.ResponseWriter, payload map[string]any) {
 		"status": "completed", "model": payload["model"], "output": []any{item},
 		"parallel_tool_calls": true, "tool_choice": valueOr(payload["tool_choice"], "auto"),
 		"tools": slice(payload["tools"]),
-		"usage": map[string]any{"input_tokens": 3, "output_tokens": 5, "total_tokens": 8},
+		"usage": map[string]any{
+			"input_tokens": 3, "output_tokens": 5, "total_tokens": 8,
+			"input_tokens_details":  map[string]any{"cached_tokens": 2},
+			"output_tokens_details": map[string]any{"reasoning_tokens": 4},
+		},
 	}
 	created := clone(response)
 	created["status"] = "in_progress"

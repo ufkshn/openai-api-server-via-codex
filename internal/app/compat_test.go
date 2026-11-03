@@ -208,3 +208,43 @@ func TestAsyncResponseHistoryPreservesPendingCalls(t *testing.T) {
 		}
 	}
 }
+
+func TestChatToResponseForwardsPromptCacheKeyAndToolChoice(t *testing.T) {
+	got := chatToResponse(map[string]any{
+		"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
+		"prompt_cache_key": "ask-gm-thread-1",
+		"tool_choice":      "none",
+	}, defaultModel)
+	if got["prompt_cache_key"] != "ask-gm-thread-1" {
+		t.Fatalf("prompt_cache_key = %#v", got["prompt_cache_key"])
+	}
+	if got["tool_choice"] != "none" {
+		t.Fatalf("tool_choice = %#v", got["tool_choice"])
+	}
+	if _, present := chatToResponse(map[string]any{"messages": []any{}}, defaultModel)["prompt_cache_key"]; present {
+		t.Fatal("prompt_cache_key must not be invented when the client sends none")
+	}
+}
+
+func TestResponseToChatMapsCachedAndReasoningTokens(t *testing.T) {
+	got := responseToChat(map[string]any{"id": "resp_1", "usage": map[string]any{
+		"input_tokens": 1000, "output_tokens": 50, "total_tokens": 1050,
+		"input_tokens_details":  map[string]any{"cached_tokens": 896},
+		"output_tokens_details": map[string]any{"reasoning_tokens": 30},
+	}}, defaultModel, false, 1)
+	usage := mapAny(got["usage"])
+	if intValue(usage["prompt_tokens"]) != 1000 || intValue(usage["completion_tokens"]) != 50 || intValue(usage["total_tokens"]) != 1050 {
+		t.Fatalf("usage = %#v", usage)
+	}
+	if cached := intValue(mapAny(usage["prompt_tokens_details"])["cached_tokens"]); cached != 896 {
+		t.Fatalf("cached_tokens = %d; usage = %#v", cached, usage)
+	}
+	if reasoning := intValue(mapAny(usage["completion_tokens_details"])["reasoning_tokens"]); reasoning != 30 {
+		t.Fatalf("reasoning_tokens = %d; usage = %#v", reasoning, usage)
+	}
+
+	bare := mapAny(responseToChat(map[string]any{"id": "resp_2", "usage": map[string]any{"input_tokens": 3, "output_tokens": 5}}, defaultModel, false, 1)["usage"])
+	if _, present := bare["prompt_tokens_details"]; present {
+		t.Fatalf("details invented without upstream breakdown: %#v", bare)
+	}
+}
