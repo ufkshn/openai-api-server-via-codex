@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -169,7 +170,8 @@ func TestUIPasteWritesAuthFilePrivatelyAndRemoveDeletesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The file holds a live ChatGPT credential; it must not be group/world readable.
-	if perm := info.Mode().Perm(); perm != 0600 {
+	// Windows has no POSIX permission bits, so there the mode is not checked.
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0600 {
 		t.Fatalf("auth.json mode = %o, want 600", perm)
 	}
 	// No temp file may be left behind next to it.
