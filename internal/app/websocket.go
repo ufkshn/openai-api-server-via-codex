@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -18,26 +20,63 @@ import (
 // WebSocket conversations belong to the upstream connection, not the HTTP
 // compatibility stores. Keep events (including unknown fields) intact.
 type websocketBackend interface {
-	dialWebSocket(context.Context, http.Header, string) (*websocket.Conn, string, error)
+	// dialWebSocket also returns the release for the account the connection
+	// holds: a WebSocket is one account's load for as long as it stays open.
+	dialWebSocket(context.Context, http.Header, string) (*websocket.Conn, string, func(), error)
 }
 
-func (b *backend) dialWebSocket(ctx context.Context, incoming http.Header, query string) (*websocket.Conn, string, error) {
+func (b *backend) dialWebSocket(ctx context.Context, incoming http.Header, query string) (*websocket.Conn, string, func(), error) {
 	target, err := resolveProxyURL(b.cfg.BackendURL, "responses", query)
 	if err != nil {
-		return nil, "", &backendError{400, "Invalid backend URL."}
-	}
-	cred, err := b.auth.borrow()
-	if err != nil {
-		logAuthFailure("websocket", err)
-		return nil, "", &backendError{401, err.Error()}
+		return nil, "", nil, &backendError{400, "Invalid backend URL."}
 	}
 	// A client-wide timeout would also terminate the upgraded connection. Only
 	// bound the handshake; established connections use bounded writes below.
 	client := *b.client
 	client.Timeout = 0
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	var hints routeHints
+	if key := incoming.Get("session_id"); key != "" {
+		hints.stickyKey = "ws:" + key
+	}
+	exclude := map[string]bool{}
+	var refused error
+	for {
+		lease, err := b.pool.acquire(hints, exclude)
+		if err != nil {
+			if refused != nil {
+				return nil, "", nil, refused
+			}
+			return nil, "", nil, poolError("websocket", err)
+		}
+		conn, err := b.dialOnAccount(ctx, target.String(), &client, incoming, lease)
+		if err == nil {
+			return conn, lease.cred.AccessToken, lease.release, nil
+		}
+		lease.release()
+		var refusal *accountRefusal
+		if !errors.As(err, &refusal) {
+			return nil, "", nil, err
+		}
+		b.pool.coolDown(lease.acct, refusal.cooldown, refusal.reason, fmt.Sprintf("Codex answered HTTP %d to the WebSocket handshake", refusal.status))
+		log.Printf("codex.account.failover account=%s status=%d stage=websocket", lease.id(), refusal.status)
+		exclude[lease.id()] = true
+		refused = &backendError{refusal.status, "Codex WebSocket handshake failed."}
+	}
+}
+
+// accountRefusal is a handshake the account, not the request, caused to fail.
+type accountRefusal struct {
+	status   int
+	cooldown time.Duration
+	reason   string
+}
+
+func (e *accountRefusal) Error() string { return "Codex WebSocket handshake failed." }
+
+func (b *backend) dialOnAccount(ctx context.Context, target string, client *http.Client, incoming http.Header, lease *accountLease) (*websocket.Conn, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		headers := b.headers(cred, true, incoming.Get("x-client-request-id"))
+		headers := b.headers(lease.cred, true, incoming.Get("x-client-request-id"))
 		headers.Del("Accept")
 		headers.Del("Content-Type")
 		// X-Fast-Mode is connection-scoped here, unlike the HTTP path where it is
@@ -50,28 +89,35 @@ func (b *backend) dialWebSocket(ctx context.Context, incoming http.Header, query
 			}
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, b.cfg.Timeout)
-		conn, resp, dialErr := websocket.Dial(dialCtx, target.String(), &websocket.DialOptions{HTTPClient: &client, HTTPHeader: headers})
+		conn, resp, dialErr := websocket.Dial(dialCtx, target, &websocket.DialOptions{HTTPClient: client, HTTPHeader: headers})
 		cancel()
 		if dialErr == nil {
-			return conn, cred.AccessToken, nil
+			return conn, nil
 		}
 		if resp == nil {
-			return nil, "", &backendError{502, "Codex WebSocket connection failed."}
+			return nil, &backendError{502, "Codex WebSocket connection failed."}
 		}
+		b.pool.observe(lease.acct, resp)
 		if resp.StatusCode == http.StatusUnauthorized {
 			action := "return_401"
 			if attempt == 0 {
 				action = "reload_and_retry"
 			}
-			log.Printf("codex.auth.unauthorized code=upstream_unauthorized stage=websocket attempt=%d action=%s", attempt+1, action)
+			log.Printf("codex.auth.unauthorized code=upstream_unauthorized stage=websocket attempt=%d action=%s account=%s", attempt+1, action, lease.id())
 			if attempt == 0 {
-				cred, err = b.auth.reload()
-				if err != nil {
+				if _, err := lease.reload(); err != nil {
 					logAuthFailure("websocket_reload_after_401", err)
-					return nil, "", &backendError{401, err.Error()}
+					return nil, &accountRefusal{http.StatusUnauthorized, unauthorizedCooldown, "unauthorized"}
 				}
 				continue
 			}
+		}
+		var body []byte
+		if resp.Body != nil {
+			body = bufferedBody(resp)
+		}
+		if d, reason, ok := cooldownForStatus(resp.StatusCode, resp.Header, body, time.Now()); ok {
+			return nil, &accountRefusal{resp.StatusCode, d, reason}
 		}
 		status := resp.StatusCode
 		if status < 400 || status > 599 {
@@ -79,9 +125,9 @@ func (b *backend) dialWebSocket(ctx context.Context, incoming http.Header, query
 		}
 		// Never expose a handshake response body or a websocket library error: both
 		// can contain credentials, response headers, or an arbitrary upstream body.
-		return nil, "", &backendError{status, "Codex WebSocket handshake failed."}
+		return nil, &backendError{status, "Codex WebSocket handshake failed."}
 	}
-	return nil, "", &backendError{502, "Codex WebSocket connection failed."}
+	return nil, &backendError{502, "Codex WebSocket connection failed."}
 }
 
 func (s *server) websocketResponse(w http.ResponseWriter, r *http.Request) {
@@ -113,11 +159,12 @@ func (s *server) websocketResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release()
-	upstream, token, err := b.dialWebSocket(r.Context(), r.Header, r.URL.RawQuery)
+	upstream, token, releaseAccount, err := b.dialWebSocket(r.Context(), r.Header, r.URL.RawQuery)
 	if err != nil {
 		writeBackendError(w, err)
 		return
 	}
+	defer releaseAccount()
 	defer upstream.CloseNow()
 	downstream, err := websocket.Accept(w, r, nil)
 	if err != nil {

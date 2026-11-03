@@ -27,9 +27,9 @@ const replayBodyMemoryLimit = 1 << 20
 
 type backend struct {
 	cfg          config
-	streamClient *http.Client
 	client       *http.Client
-	auth         *authProvider
+	streamClient *http.Client
+	pool         *accountPool
 }
 type backendError struct {
 	Status  int
@@ -204,10 +204,7 @@ func newBackend(cfg config) *backend {
 		client: client,
 		// stream applies cfg.Timeout between events, so a long response can finish.
 		streamClient: &http.Client{},
-		auth: &authProvider{
-			path:          cfg.AuthJSON,
-			refreshClient: &http.Client{Timeout: authRefreshTimeout},
-		},
+		pool:         newAccountPool(cfg.AuthJSON, &http.Client{Timeout: authRefreshTimeout}),
 	}
 }
 
@@ -254,18 +251,82 @@ func (b *backend) headersWithTier(cred credentials, stream bool, requestID, serv
 	return h
 }
 
-func (b *backend) doAuthenticated(makeRequest func(credentials) (*http.Request, error)) (*http.Response, error) {
-	return b.doAuthenticatedWith(b.client, makeRequest)
+// doAuthenticated sends one upstream request on an account from the pool. An
+// answer that condemns the account rather than the request — 429, or a 401 that
+// survives a credential reload — cools that account down and the request moves
+// to the next one. Only when no account is left is that refusal returned. The
+// returned response's Body releases the account when closed.
+func (b *backend) doAuthenticated(hints routeHints, makeRequest func(*accountLease) (*http.Request, error)) (*http.Response, *accountLease, error) {
+	return b.doAuthenticatedWith(b.client, hints, makeRequest)
 }
 
-func (b *backend) doAuthenticatedWith(client *http.Client, makeRequest func(credentials) (*http.Request, error)) (*http.Response, error) {
-	cred, err := b.auth.borrow()
-	if err != nil {
-		logAuthFailure("request", err)
-		return nil, &backendError{401, err.Error()}
+// doAuthenticatedWith is doAuthenticated on a chosen client: streams use one
+// without a whole-request timeout, because their timeout runs between events.
+func (b *backend) doAuthenticatedWith(client *http.Client, hints routeHints, makeRequest func(*accountLease) (*http.Request, error)) (*http.Response, *accountLease, error) {
+	exclude := map[string]bool{}
+	var refused *http.Response
+	var refusedLease *accountLease
+	var credentialErr error
+	for {
+		lease, err := b.pool.acquire(hints, exclude)
+		if err != nil {
+			if refused != nil {
+				return refused, refusedLease, nil
+			}
+			if credentialErr != nil {
+				return nil, nil, &backendError{401, credentialErr.Error()}
+			}
+			return nil, nil, poolError("request", err)
+		}
+		resp, err := b.sendOnAccount(client, lease, makeRequest)
+		if err != nil {
+			lease.release()
+			var credErr *accountCredentialError
+			if errors.As(err, &credErr) {
+				b.pool.coolDown(lease.acct, unauthorizedCooldown, "unauthorized", redactSensitive(credErr.err.Error()))
+				exclude[lease.id()] = true
+				credentialErr = credErr.err
+				continue
+			}
+			return nil, nil, err
+		}
+		b.pool.observe(lease.acct, resp)
+		if resp.StatusCode == http.StatusBadRequest && len(hints.reasoningKeys) > 0 && !lease.pinMissed {
+			// Encrypted reasoning only decrypts on the account that made it. The
+			// pool normally routes it home; after a restart it cannot know where
+			// home is, so the reasoning is dropped and the request sent again.
+			if body := bufferedBody(resp); encryptedContentRejected(body) {
+				log.Printf("codex.account.reasoning_rejected account=%s action=resend_without_reasoning", lease.id())
+				lease.pinMissed = true
+				resp, err = b.sendOnAccount(client, lease, makeRequest)
+				if err != nil {
+					lease.release()
+					return nil, nil, err
+				}
+				b.pool.observe(lease.acct, resp)
+			}
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
+			body := bufferedBody(resp)
+			if d, reason, ok := cooldownForStatus(resp.StatusCode, resp.Header, body, time.Now()); ok {
+				b.pool.coolDown(lease.acct, d, reason, fmt.Sprintf("Codex answered HTTP %d", resp.StatusCode))
+				log.Printf("codex.account.failover account=%s status=%d", lease.id(), resp.StatusCode)
+				exclude[lease.id()] = true
+				lease.release()
+				refused, refusedLease = resp, lease
+				continue
+			}
+		}
+		resp.Body = &leaseBody{ReadCloser: resp.Body, lease: lease}
+		return resp, lease, nil
 	}
+}
+
+// sendOnAccount keeps the single-account rule: a 401 reloads the credentials
+// (someone may have rewritten auth.json) and retries once.
+func (b *backend) sendOnAccount(client *http.Client, lease *accountLease, makeRequest func(*accountLease) (*http.Request, error)) (*http.Response, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		req, err := makeRequest(cred)
+		req, err := makeRequest(lease)
 		if err != nil {
 			return nil, err
 		}
@@ -277,21 +338,73 @@ func (b *backend) doAuthenticatedWith(client *http.Client, makeRequest func(cred
 			return resp, nil
 		}
 		if attempt == 1 {
-			log.Printf("codex.auth.unauthorized code=upstream_unauthorized stage=upstream attempt=2 action=return_401")
+			log.Printf("codex.auth.unauthorized code=upstream_unauthorized stage=upstream attempt=2 action=return_401 account=%s", lease.id())
 			return resp, nil
 		}
-		log.Printf("codex.auth.unauthorized code=upstream_unauthorized stage=upstream attempt=1 action=reload_and_retry")
+		log.Printf("codex.auth.unauthorized code=upstream_unauthorized stage=upstream attempt=1 action=reload_and_retry account=%s", lease.id())
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
-		previousAccessToken := cred.AccessToken
-		cred, err = b.auth.reload()
+		previousAccessToken := lease.cred.AccessToken
+		cred, err := lease.reload()
 		if err != nil {
 			logAuthFailure("reload_after_401", err)
-			return nil, &backendError{401, err.Error()}
+			return nil, &accountCredentialError{err}
 		}
 		b.debugf("codex.auth.reloaded_after_unauthorized credentials_changed=%t", previousAccessToken != cred.AccessToken)
 	}
 	panic("unreachable")
+}
+
+// accountCredentialError is an account whose credentials stopped loading
+// mid-request; the request can still move to another account.
+type accountCredentialError struct{ err error }
+
+func (e *accountCredentialError) Error() string { return e.err.Error() }
+
+type leaseBody struct {
+	io.ReadCloser
+	lease *accountLease
+}
+
+func (l *leaseBody) Close() error {
+	err := l.ReadCloser.Close()
+	l.lease.release()
+	return err
+}
+
+// poolError turns "no account could be tried" into the client-facing error.
+func poolError(stage string, err error) error {
+	var unavailable *poolUnavailable
+	if errors.As(err, &unavailable) {
+		log.Printf("codex.account.unavailable stage=%s message=%q", stage, unavailable.message)
+		return &backendError{unavailable.status, unavailable.message}
+	}
+	logAuthFailure(stage, err)
+	return &backendError{401, err.Error()}
+}
+
+func encryptedContentRejected(body []byte) bool {
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "encrypted_content") || strings.Contains(text, "encrypted content")
+}
+
+// withoutEncryptedReasoning drops replayed reasoning the serving account could
+// not decrypt. The model loses that reasoning, not the conversation.
+func withoutEncryptedReasoning(payload map[string]any) map[string]any {
+	result := cloneMap(payload)
+	input, ok := result["input"].([]any)
+	if !ok {
+		return result
+	}
+	kept := make([]any, 0, len(input))
+	for _, raw := range input {
+		if item := mapAny(raw); item != nil && item["type"] == "reasoning" && stringValue(item["encrypted_content"]) != "" {
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	result["input"] = kept
+	return result
 }
 
 func logAuthFailure(stage string, err error) {
@@ -492,14 +605,22 @@ func (b *backend) streamOnce(ctx context.Context, payload map[string]any, fn fun
 		}
 		return nil
 	}
-	resp, err := b.doAuthenticatedWith(b.streamClient, func(cred credentials) (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.BackendURL+"/responses", bytes.NewReader(body))
+	var stripped []byte
+	resp, lease, err := b.doAuthenticatedWith(b.streamClient, hintsForPayload(prepared), func(lease *accountLease) (*http.Request, error) {
+		requestBody := body
+		if lease.pinMissed {
+			if stripped == nil {
+				stripped, _ = json.Marshal(withoutEncryptedReasoning(prepared))
+			}
+			requestBody = stripped
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.BackendURL+"/responses", bytes.NewReader(requestBody))
 		if err != nil {
 			return nil, err
 		}
 		// Read the tier from prepared, not payload, so --drop-params service_tier
 		// removes it from the header too rather than only from the body.
-		req.Header = b.headersWithTier(cred, true, stringValue(prepared["prompt_cache_key"]), stringValue(prepared["service_tier"]), fastMode)
+		req.Header = b.headersWithTier(lease.cred, true, stringValue(prepared["prompt_cache_key"]), stringValue(prepared["service_tier"]), fastMode)
 		return req, nil
 	})
 	if err != nil {
@@ -517,6 +638,8 @@ func (b *backend) streamOnce(ctx context.Context, payload map[string]any, fn fun
 	if resp.StatusCode/100 != 2 {
 		return decodeBackendError(resp)
 	}
+	account := lease.id()
+	b.debugf("codex.stream.account account=%s", account)
 	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	var data strings.Builder
 	events := 0
@@ -545,6 +668,10 @@ func (b *backend) streamOnce(ctx context.Context, payload map[string]any, fn fun
 			if mapAny(event["response"]) != nil {
 				terminal, finished = true, true
 			}
+		case "response.output_item.done":
+			b.pool.rememberOutput(account, mapAny(event["item"]))
+		case "codex.rate_limits":
+			b.pool.observeRateLimitEvent(account, event)
 		}
 		// A slow client must not count as an idle backend.
 		idle.Stop()
@@ -681,12 +808,12 @@ func (b *backend) collect(ctx context.Context, payload map[string]any) (map[stri
 }
 
 func (b *backend) listModels(ctx context.Context) []string {
-	resp, err := b.doAuthenticated(func(cred credentials) (*http.Request, error) {
+	resp, _, err := b.doAuthenticated(routeHints{}, func(lease *accountLease) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.cfg.BackendURL+"/models?client_version="+url.QueryEscape(b.cfg.ClientVersion), nil)
 		if err != nil {
 			return nil, err
 		}
-		req.Header = b.headers(cred, false, "")
+		req.Header = b.headers(lease.cred, false, "")
 		return req, nil
 	})
 	if err != nil {
@@ -729,12 +856,12 @@ func (b *backend) proxyTo(ctx context.Context, method, baseURL, path, query stri
 		return nil, &backendError{400, "Read proxy request body failed."}
 	}
 	defer replay.Close()
-	resp, err := b.doAuthenticated(func(cred credentials) (*http.Request, error) {
+	resp, _, err := b.doAuthenticated(routeHints{}, func(lease *accountLease) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, method, target.String(), replay.Reader())
 		if err != nil {
 			return nil, err
 		}
-		req.Header = b.headers(cred, false, "")
+		req.Header = b.headers(lease.cred, false, "")
 		for _, name := range []string{"Accept", "Content-Type", "Idempotency-Key", "OpenAI-Beta", "OpenAI-Organization", "OpenAI-Project", "OpenAI-Version"} {
 			if v := headers.Get(name); v != "" {
 				req.Header.Set(name, v)

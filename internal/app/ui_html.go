@@ -76,12 +76,47 @@ const uiHTML = `<!doctype html>
   .msg.good { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
   a { color: var(--accent); }
   .hide { display: none; }
+  .acct { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+  .acct.off { border-style: dashed; }
+  .acct.off > :not(.acct-actions) { opacity: .55; }
+  .acct-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .acct-name { font-weight: 600; word-break: break-all; }
+  .acct-meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .pill { font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 99px; white-space: nowrap; }
+  .pill.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); }
+  .pill.bad { background: color-mix(in srgb, var(--bad) 13%, transparent); }
+  .pill.warn { color: #a15c00; background: color-mix(in srgb, #e69500 18%, transparent); }
+  .pill.muted { color: var(--muted); background: var(--code-bg); }
+  .meter { display: grid; grid-template-columns: 92px 1fr 46px; gap: 8px; align-items: center;
+           font-size: 12.5px; color: var(--muted); margin-top: 7px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--code-bg); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .bar i.hot { background: var(--bad); }
+  .acct-actions { margin-top: 10px; }
+  .acct-actions button { padding: 5px 11px; font-size: 13px; margin-top: 4px; }
+  button.enable { background: color-mix(in srgb, var(--ok) 18%, transparent); border-color: color-mix(in srgb, var(--ok) 60%, var(--line)); color: var(--ok); }
+  button.enable::before { content: "\25B6"; font-size: 9px; margin-right: 6px; vertical-align: 1px; }
+  button.enable:hover { background: color-mix(in srgb, var(--ok) 28%, transparent); }
+  button.danger { background: transparent; color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); font-weight: 500; }
+  button.danger.solid { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; }
+  .modal { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+           padding: 16px; background: rgba(8, 10, 14, .55); z-index: 10; }
+  .modal.hide { display: none; }
+  .modal-box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+               max-width: 420px; width: 100%; padding: 20px 22px; box-shadow: 0 18px 50px rgba(0,0,0,.35); }
+  .modal-box h3 { margin: 0 0 8px; font-size: 16px; }
+  .modal-box p { margin: 0 0 6px; color: var(--muted); font-size: 13.5px; line-height: 1.5; }
+  .modal-box strong { color: var(--ink); word-break: break-all; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  select { padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+           background: var(--bg); color: var(--ink); font: inherit; margin-bottom: 10px; width: 100%; }
+  .summary { font-size: 13.5px; color: var(--muted); margin-bottom: 12px; }
 </style>
 </head>
 <body>
 <main>
   <h1>Codex Proxy</h1>
-  <div class="sub">Operator console — sign this proxy in to a ChatGPT account.</div>
+  <div class="sub">Operator console — the ChatGPT accounts this proxy spreads its requests across.</div>
 
   <div id="msg" class="msg"></div>
 
@@ -94,20 +129,22 @@ const uiHTML = `<!doctype html>
 
   <div id="app" class="hide">
     <section>
-      <h2>Status</h2>
-      <div id="status"></div>
-      <div style="margin-top:14px">
+      <h2>Accounts</h2>
+      <div class="summary" id="summary"></div>
+      <div id="accounts"></div>
+      <div style="margin-top:4px">
         <button class="ghost" id="refresh">Refresh</button>
         <button class="ghost" id="lock">Lock console</button>
       </div>
     </section>
 
     <section>
-      <h2>Sign in with a device code</h2>
+      <h2 id="device-title">Add an account with a device code</h2>
       <div id="device-idle">
         <p class="note">Starts a sign-in and opens the verification page in a new tab.
-          Copy the one-time code, enter it there, and this proxy receives the tokens.</p>
-        <button id="start">Start sign-in</button>
+          Copy the one-time code, enter it there while signed in to the ChatGPT account
+          you want to add, and the proxy starts using it.</p>
+        <button id="start">Add account</button>
       </div>
       <div id="device-active" class="hide">
         <div class="code" id="user-code">…</div>
@@ -123,10 +160,17 @@ const uiHTML = `<!doctype html>
       <h2>Paste an auth.json</h2>
       <p class="note" style="margin-top:0">Fallback for when device sign-in is unavailable.
         Run <code>codex login</code> elsewhere, then paste the resulting
-        <code>~/.codex/auth.json</code> here.</p>
+        <code>~/.codex/auth.json</code> here. Use a fresh login: a copy of a file
+        another process is still using breaks both once either refreshes.</p>
+      <label for="paste-target">Save as</label>
+      <select id="paste-target"><option value="">A new account</option></select>
       <textarea id="authjson" spellcheck="false" placeholder='{"auth_mode":"chatgpt","tokens":{...}}'></textarea>
       <button id="save">Save auth.json</button>
-      <button class="ghost" id="signout">Sign out</button>
+    </section>
+
+    <section>
+      <h2>Proxy</h2>
+      <div id="status"></div>
     </section>
   </div>
 </main>
@@ -201,23 +245,82 @@ const uiHTML = `<!doctype html>
     });
   }
 
-  function renderStatus(s) {
-    var html = '';
-    html += s.signed_in
-      ? row('Signed in', 'yes', 'ok')
-      : row('Signed in', 'no', 'bad');
-    if (s.email) { html += row('Account', esc(s.email)); }
-    if (s.account_id) { html += row('Account id', esc(s.account_id)); }
-    if (s.expires_at) {
-      var mins = Math.round((s.expires_in_seconds || 0) / 60);
-      html += row('Token expires', esc(s.expires_at) + ' (' + mins + ' min)');
+  function pct(v) { return Math.round(v * 10) / 10; }
+
+  function until(iso) {
+    if (!iso) { return ''; }
+    var secs = Math.max(0, Math.round((new Date(iso) - Date.now()) / 1000));
+    if (secs < 90) { return secs + 's'; }
+    if (secs < 5400) { return Math.round(secs / 60) + ' min'; }
+    if (secs < 172800) { return Math.round(secs / 3600) + ' h'; }
+    return Math.round(secs / 86400) + ' d';
+  }
+
+  function meter(label, percent, resets) {
+    if (percent === undefined) { return ''; }
+    var width = Math.max(0, Math.min(100, percent));
+    return '<div class="meter"><span>' + label + '</span><div class="bar"><i' +
+      (width >= 90 ? ' class="hot"' : '') + ' style="width:' + width + '%"></i></div><span>' +
+      pct(percent) + '%</span></div>' +
+      (resets ? '<div class="acct-meta" style="margin-left:100px">resets in ' + until(resets) + '</div>' : '');
+  }
+
+  function accountState(a) {
+    if (!a.enabled) { return ['Disabled', 'muted']; }
+    if (!a.signed_in) { return ['Signed out', 'bad']; }
+    if (a.cooling_until) {
+      var why = a.cooling_reason === 'usage_limit' ? 'Usage limit' :
+        a.cooling_reason === 'unauthorized' ? 'Rejected' : 'Rate limited';
+      return [why + ' · ' + until(a.cooling_until), 'warn'];
     }
-    html += row('auth.json', s.auth_file_present ? esc(s.auth_path) : 'missing',
-      s.auth_file_present ? '' : 'bad');
+    return ['Active', 'ok'];
+  }
+
+  function renderAccount(a) {
+    var state = accountState(a);
+    var name = a.email || a.account_id || a.id;
+    var meta = ['id ' + a.id];
+    if (a.plan) { meta.push(a.plan); }
+    meta.push(a.in_flight + ' in flight', a.served + ' requests');
+    if (a.expires_at) { meta.push('token ' + until(a.expires_at)); }
+    var html = '<div class="acct' + (a.enabled ? '' : ' off') + '">';
+    html += '<div class="acct-head"><span class="acct-name">' + esc(name) + '</span>' +
+      '<span class="pill ' + state[1] + '">' + esc(state[0]) + '</span></div>';
+    html += '<div class="acct-meta">' + esc(meta.join(' · ')) + '</div>';
+    html += meter('5h window', a.primary_used_percent, a.primary_resets_at);
+    html += meter('Weekly', a.secondary_used_percent, a.secondary_resets_at);
+    var problem = !a.signed_in ? a.error : a.last_error;
+    if (problem) { html += '<div class="acct-meta bad" style="margin-top:6px">' + esc(problem) + '</div>'; }
+    html += '<div class="acct-actions">' +
+      (a.enabled
+        ? '<button class="ghost" data-act="disable" data-id="' + esc(a.id) + '">Disable</button>'
+        : '<button class="enable" data-act="enable" data-id="' + esc(a.id) + '">Enable</button>') +
+      '<button class="ghost" data-act="resign" data-id="' + esc(a.id) + '">Sign in again</button>' +
+      '<button class="danger" data-act="remove" data-id="' + esc(a.id) + '" data-name="' + esc(name) + '">Remove</button>' +
+      '</div></div>';
+    return html;
+  }
+
+  function renderStatus(s) {
+    var accounts = s.accounts || [];
+    $('summary').textContent = accounts.length === 0
+      ? 'No account yet — add one below. The proxy rejects every request until then.'
+      : s.ready_accounts + ' of ' + accounts.length + ' account' + (accounts.length === 1 ? '' : 's') +
+        ' ready. Requests go to the least busy ready account.';
+    $('accounts').innerHTML = accounts.map(renderAccount).join('');
+
+    var target = $('paste-target'), chosen = target.value;
+    target.innerHTML = '<option value="">A new account</option>' + accounts.map(function (a) {
+      return '<option value="' + esc(a.id) + '">Replace ' + esc(a.email || a.id) + '</option>';
+    }).join('');
+    target.value = chosen;
+    if (target.value !== chosen) { target.value = ''; }
+
+    var html = '';
+    html += row('Auth directory', esc(s.auth_dir));
     html += row('Default model', esc(s.default_model));
     html += row('Codex CLI', s.codex_cli ? 'available' : 'not installed',
       s.codex_cli ? '' : 'bad');
-    if (!s.signed_in && s.error) { html += row('Detail', esc(s.error), 'bad'); }
     $('status').innerHTML = html;
 
     var d = s.signin || {};
@@ -233,10 +336,10 @@ const uiHTML = `<!doctype html>
     } else {
       $('device-idle').className = '';
       $('device-active').className = 'hide';
-      // Surface why a finished attempt ended, since the panel it happened in
-      // has just been replaced by the idle one.
-      if (d.failed && d.message) { show(d.message); }
     }
+    // Surface how a finished attempt ended, once, since the panel it happened
+    // in has just been replaced by the idle one.
+    if (!d.running && poll && d.message) { show(d.message, d.failed ? 'err' : 'good'); }
     // Stop polling once the login settles, so an idle console is quiet.
     if (!d.running && poll) { clearInterval(poll); poll = null; }
     if (!s.codex_cli) { $('start').disabled = true; }
@@ -274,23 +377,68 @@ const uiHTML = `<!doctype html>
 
   $('refresh').onclick = refresh;
 
-  $('start').onclick = function () {
+  function startSignIn(account) {
     $('start').disabled = true;
     // Opened synchronously inside the click handler: the code arrives later, over
     // the poll, and a window.open() from that callback is outside the user-gesture
     // window and gets swallowed by popup blockers. The URL is a constant, so there
     // is nothing to wait for anyway.
     var tab = window.open(VERIFY_URL, '_blank', 'noopener');
-    api('signin/start', {}).then(function () {
+    api('signin/start', { account: account || '' }).then(function () {
       if (poll) { clearInterval(poll); }
       poll = setInterval(refresh, 3000);
+      $('device-active').scrollIntoView({ behavior: 'smooth', block: 'center' });
       return refresh();
     }).catch(function (e) {
       // Nothing will be entered on that page now — don't leave it stranded.
       if (tab) { try { tab.close(); } catch (_) {} }
       show(e.message);
     }).then(function () { $('start').disabled = false; });
+  }
+
+  $('start').onclick = function () { startSignIn(''); };
+
+  $('accounts').onclick = function (e) {
+    var btn = e.target.closest('button[data-act]');
+    if (!btn) { return; }
+    var id = btn.getAttribute('data-id'), act = btn.getAttribute('data-act');
+    if (act === 'resign') { startSignIn(id); return; }
+    if (act === 'remove') {
+      askRemove(btn.getAttribute('data-name')).then(function (yes) { if (yes) { runAction(btn, id, act); } });
+      return;
+    }
+    runAction(btn, id, act);
   };
+
+  // An in-page dialog rather than confirm(): embedded browsers may suppress
+  // native dialogs, which would make Remove silently do nothing.
+  function askRemove(name) {
+    $('confirm-name').textContent = name;
+    $('confirm').classList.remove('hide');
+    $('confirm-cancel').focus();
+    return new Promise(function (resolve) {
+      function done(yes) {
+        $('confirm').classList.add('hide');
+        $('confirm-ok').onclick = $('confirm-cancel').onclick = $('confirm').onclick = null;
+        document.removeEventListener('keydown', onKey);
+        resolve(yes);
+      }
+      function onKey(e) { if (e.key === 'Escape') { done(false); } }
+      $('confirm-ok').onclick = function () { done(true); };
+      $('confirm-cancel').onclick = function () { done(false); };
+      $('confirm').onclick = function (e) { if (e.target === $('confirm')) { done(false); } };
+      document.addEventListener('keydown', onKey);
+    });
+  }
+
+  function runAction(btn, id, act) {
+    btn.disabled = true;
+    api('accounts/' + act, { account: id }).then(function () {
+      show({ enable: 'Account enabled.', disable: 'Account disabled — it gets no new requests.',
+        remove: 'Account removed.' }[act], 'good');
+      return refresh();
+    }).catch(function (e) { show(e.message); btn.disabled = false; });
+  }
 
   $('copy').onclick = function () {
     var code = $('user-code').textContent.trim();
@@ -309,17 +457,9 @@ const uiHTML = `<!doctype html>
   };
 
   $('save').onclick = function () {
-    api('auth/paste', { content: $('authjson').value }).then(function () {
+    api('auth/paste', { content: $('authjson').value, account: $('paste-target').value }).then(function (r) {
       $('authjson').value = '';
-      show('Saved. Credentials reloaded.', 'good');
-      return refresh();
-    }).catch(function (e) { show(e.message); });
-  };
-
-  $('signout').onclick = function () {
-    if (!confirm('Remove auth.json? The proxy stops serving until it is signed in again.')) { return; }
-    api('auth/delete', {}).then(function () {
-      show('Signed out.', 'good');
+      show(r.message || 'Saved.', 'good');
       return refresh();
     }).catch(function (e) { show(e.message); });
   };
@@ -332,6 +472,17 @@ const uiHTML = `<!doctype html>
   api('status').then(function (s) { unlock(); renderStatus(s); }).catch(function () { lock(); });
 })();
 </script>
+<div id="confirm" class="modal hide" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="modal-box">
+    <h3 id="confirm-title">Remove account?</h3>
+    <p><strong id="confirm-name"></strong> stops receiving requests and its login is deleted from the proxy.</p>
+    <p>Adding it back needs a new sign-in.</p>
+    <div class="modal-actions">
+      <button class="ghost" id="confirm-cancel">Cancel</button>
+      <button class="danger solid" id="confirm-ok">Remove account</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 `

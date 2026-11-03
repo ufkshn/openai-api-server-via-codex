@@ -34,10 +34,10 @@ type server struct {
 	responses *responseStore
 	chats     *chatStore
 	slots     chan struct{}
-	// auth is the same provider the backend uses. The console needs it directly
-	// to report status and to drop the cache after rewriting auth.json; it is
-	// nil when the backend is a test double, so callers go through backendAuth.
-	auth      *authProvider
+	// pool is the same account pool the backend routes through. The console
+	// needs it directly to list and manage accounts; it is nil when the backend
+	// is a test double, so callers go through accountPool.
+	pool      *accountPool
 	sessions  *uiSessions
 	device    *deviceLogin
 	wsMu      sync.Mutex
@@ -46,14 +46,14 @@ type server struct {
 	wsClosing bool
 }
 
-// backendAuth returns the credential provider, falling back to one built from
-// config when the server was constructed with a stubbed backend.
-func (s *server) backendAuth() *authProvider {
-	if s.auth != nil {
-		return s.auth
+// accountPool returns the backend's account pool, falling back to one built
+// from config when the server was constructed with a stubbed backend.
+func (s *server) accountPool() *accountPool {
+	if s.pool != nil {
+		return s.pool
 	}
-	s.auth = &authProvider{path: s.cfg.AuthJSON, refreshClient: &http.Client{Timeout: authRefreshTimeout}}
-	return s.auth
+	s.pool = newAccountPool(s.cfg.AuthJSON, &http.Client{Timeout: authRefreshTimeout})
+	return s.pool
 }
 
 type codexBackend interface {
@@ -72,9 +72,9 @@ func startupLogMessage(version, address string) string {
 
 func serve(cfg config, version string) error {
 	b := newBackend(cfg)
-	if _, err := b.auth.borrow(); err != nil {
+	if err := b.pool.preflight(); err != nil {
 		// Failing closed here would make the console unreachable in exactly the
-		// situation it exists for: no auth.json yet, and no shell to run
+		// situation it exists for: no account signed in yet, and no shell to run
 		// `codex login`. When the console is enabled the server starts anyway and
 		// serves /ui so the login can be established; /v1 still rejects every
 		// request until it is. Without a console there is nothing to recover
@@ -87,7 +87,7 @@ func serve(cfg config, version string) error {
 			authFailureCode(err), redactSensitive(err.Error()),
 		)
 	}
-	s := &server{cfg: cfg, backend: b, auth: b.auth, responses: newResponseStore(cfg.MaxStored), chats: newChatStore(cfg.MaxStored), sessions: newUISessions(), device: &deviceLogin{}}
+	s := &server{cfg: cfg, backend: b, pool: b.pool, responses: newResponseStore(cfg.MaxStored), chats: newChatStore(cfg.MaxStored), sessions: newUISessions(), device: &deviceLogin{}}
 	defer s.abortWebSockets()
 	if cfg.Concurrency > 0 {
 		s.slots = make(chan struct{}, cfg.Concurrency)
