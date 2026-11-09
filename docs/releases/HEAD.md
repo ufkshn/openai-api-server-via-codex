@@ -15,6 +15,12 @@
   `n=1`, and `partial_images` accepts `0`-`3` as a hint; Codex decides how many
   previews it actually sends, so only the completed event is guaranteed.
 - Added `input_fidelity` passthrough for image generations and edits.
+- Added the `/imagegen/v1` base URL, which draws the way the Codex CLI's
+  `image_gen` tool does: through Codex's standalone Images endpoint instead of
+  the hosted `image_generation` tool. It serves `images/generations`,
+  `images/edits`, and `responses`; on `responses` the server runs the CLI's
+  model → draw → model loop and still returns `image_generation_call` items.
+  `/v1` is unchanged.
 
 ## Distribution
 

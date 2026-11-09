@@ -597,6 +597,39 @@ response = client.responses.create(
 
 </details>
 
+<details>
+<summary><strong>Drawing like the Codex CLI: the <code>/imagegen/v1</code> routes</strong></summary>
+
+`/v1` draws with the hosted `image_generation` tool inside `/codex/responses`.
+The Codex CLI (0.166 and later) draws differently: its `image_gen` tool calls
+Codex's standalone Images endpoint, `/codex/images/generations` and
+`/codex/images/edits`. The same server serves that path under a second base URL:
+
+```python
+client = OpenAI(base_url="http://127.0.0.1:8080/imagegen/v1", api_key="...")
+```
+
+- `POST /imagegen/v1/images/generations` and `/images/edits` send the request
+  straight to the Images endpoint with the CLI's body (`model="gpt-image-2"`,
+  `quality` and `size` `"auto"` unless given, `background` opaque or
+  transparent). A masked edit keeps the hosted tool: the Images endpoint takes no
+  mask. `stream=true` sends one `*.completed` event, without partial images.
+- `POST /imagegen/v1/responses` with an `image_generation` tool runs the CLI's
+  loop. The model is offered an `imagegen` function instead; when it calls it,
+  the server draws on the Images endpoint, shows the client an
+  `image_generation_call` item, returns the picture to the model as the call's
+  output, and lets the model finish. The model chooses up to five recent
+  conversation images to edit (`num_last_images_to_include`). `max_tool_calls`
+  bounds the drawings; without it a response draws at most eight.
+- The response reports the `quality` and `size` the endpoint actually used; it
+  has been seen to ignore requested values. The server logs each draw as
+  `codex.imagegen.done ... quality=... size=...`.
+- Every other `/imagegen/v1` route behaves exactly like its `/v1` twin, so a
+  client switches by changing only its base URL. The Responses WebSocket stays on
+  the hosted tool.
+
+</details>
+
 ## API compatibility
 
 <details>
