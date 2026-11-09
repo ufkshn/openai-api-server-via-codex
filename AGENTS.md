@@ -175,6 +175,14 @@ python scripts/release-notes.py vX.Y.Z
   `partial_image` events and treats `partial_images` as a hint only: live runs
   have produced both fewer and more previews than requested, so never assert an
   exact preview count. Codex may also ignore a requested `size`.
+- `/imagegen/v1/...` (imagegen.go) is the Codex CLI's drawing path: Codex's own
+  `/codex/images/generations` and `/images/edits` endpoints, JSON bodies with
+  `images: [{image_url}]`, as in codex-rs `ext/image-generation`. On `/responses`
+  the hosted tool becomes an `imagegen` function and the server runs the
+  model → draw → model loop itself. Codex reserves the CLI's own name
+  `image_gen.imagegen` for its exact schema, and refuses `max_tool_calls`, so the
+  loop enforces that limit. A follow-up's stored context holds the real function
+  call and output, not the image items the client was shown.
 - Images are returned as `data[].b64_json`. `response_format="url"` stays
   unimplemented on purpose: Codex returns image bytes, so a URL would require this
   server to host the blobs itself rather than to proxy anything.

@@ -1483,6 +1483,9 @@ func (f faultBackend) proxy(context.Context, string, string, string, http.Header
 func (f faultBackend) transcribe(context.Context, http.Header, io.Reader) (*http.Response, error) {
 	return nil, f.err
 }
+func (f faultBackend) imagesCall(context.Context, bool, map[string]any) (map[string]any, error) {
+	return nil, f.err
+}
 
 func TestBackendInterfaceMasksInjectedInternalFault(t *testing.T) {
 	s := &server{

@@ -62,6 +62,7 @@ type codexBackend interface {
 	listModels(context.Context) []string
 	proxy(context.Context, string, string, string, http.Header, io.Reader) (*http.Response, error)
 	transcribe(context.Context, http.Header, io.Reader) (*http.Response, error)
+	imagesCall(context.Context, bool, map[string]any) (map[string]any, error)
 }
 
 const startupLogMarker = "listening on http://"
@@ -235,6 +236,7 @@ func (s *server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveUI(w, r)
 		return
 	}
+	imagegen := imagegenRoute(r)
 	if r.URL.Path != "/v1" && !strings.HasPrefix(r.URL.Path, "/v1/") {
 		http.NotFound(w, r)
 		return
@@ -260,7 +262,7 @@ func (s *server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "responses":
 		s.websocketResponse(w, r)
 	case r.Method == http.MethodPost && path == "responses":
-		s.createResponse(w, r)
+		s.createResponse(w, r, imagegen)
 	case r.Method == http.MethodPost && path == "responses/input_tokens":
 		s.inputTokens(w, r)
 	case strings.HasPrefix(path, "responses/") && isResponseResourceRoute(r.Method, strings.TrimPrefix(path, "responses/")):
@@ -271,6 +273,10 @@ func (s *server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.chatResource(w, r, strings.TrimPrefix(path, "chat/completions/"))
 	case r.Method == http.MethodPost && path == "audio/transcriptions":
 		s.audio(w, r)
+	case r.Method == http.MethodPost && path == "images/generations" && imagegen:
+		s.imagegenImages(w, r, false)
+	case r.Method == http.MethodPost && path == "images/edits" && imagegen:
+		s.imagegenImages(w, r, true)
 	case r.Method == http.MethodPost && path == "images/generations":
 		s.images(w, r, false)
 	case r.Method == http.MethodPost && path == "images/edits":
@@ -346,7 +352,10 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }
 
-func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
+// createResponse serves POST /v1/responses. On /imagegen/v1 a request that
+// offers the image_generation tool draws through Codex's Images endpoint
+// instead (imagegen.go).
+func (s *server) createResponse(w http.ResponseWriter, r *http.Request, imagegen bool) {
 	body, err := decodeObject(r)
 	if err != nil {
 		writeError(w, 400, "Invalid JSON body.", "invalid_request_error", nil, nil)
@@ -369,6 +378,10 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
 	}
 	downstream := cloneMap(prepared)
 	delete(downstream, "previous_response_id")
+	if imagegen && imageGenerationTool(downstream) != nil {
+		s.imagegenResponse(w, r, prepared, downstream, previous, boolValue(body["stream"]))
+		return
+	}
 	if boolValue(body["stream"]) {
 		s.streamResponse(w, r, prepared, downstream, previous)
 		return
@@ -946,6 +959,12 @@ func (s *server) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		writeError(w, 400, err.Message, "invalid_request_error", strPtr(err.Param), nil)
 		return
 	}
+	s.serveImages(w, r, body, edit)
+}
+
+// serveImages draws a decoded, validated image request with the hosted
+// image_generation tool.
+func (s *server) serveImages(w http.ResponseWriter, r *http.Request, body map[string]any, edit bool) {
 	if imageStreamRequested(body) {
 		s.streamImages(w, r, body, edit)
 		return
