@@ -235,6 +235,90 @@ func TestImagegenResponseStreamRenumbersAndHidesFunctionCall(t *testing.T) {
 	}
 }
 
+// unansweredCalls lists the function calls in a stored context that have no
+// function_call_output; Codex rejects a follow-up that carries one.
+func unansweredCalls(context []any) []string {
+	answered := map[string]bool{}
+	for _, raw := range context {
+		if item := mapAny(raw); item["type"] == "function_call_output" {
+			answered[stringValue(item["call_id"])] = true
+		}
+	}
+	var missing []string
+	for _, raw := range context {
+		if item := mapAny(raw); item["type"] == "function_call" && !answered[stringValue(item["call_id"])] {
+			missing = append(missing, stringValue(item["call_id"]))
+		}
+	}
+	return missing
+}
+
+func TestImagegenResponseStopsForTheCallersOwnToolCall(t *testing.T) {
+	lookup := map[string]any{"id": "fc_2", "type": "function_call", "call_id": "call_fc_2", "name": "lookup", "arguments": `{"q":"cube"}`, "status": "completed"}
+	backend := &scriptedBackend{rounds: [][]map[string]any{
+		roundEvents("resp_1", imagegenCall("fc_1", `{"prompt":"a red cube"}`), lookup),
+	}}
+	s := newImagegenServer(backend)
+	recorder := postJSON(t, s, "/imagegen/v1/responses", map[string]any{
+		"input": "draw a cube and look it up",
+		"tools": []any{map[string]any{"type": "image_generation"}, map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}},
+	})
+	if recorder.Code != 200 {
+		t.Fatalf("status = %d %s", recorder.Code, recorder.Body.String())
+	}
+	// The run ends after the round, without asking Codex to continue past the caller's call.
+	if len(backend.payloads) != 1 || len(backend.images) != 1 {
+		t.Fatalf("rounds = %d draws = %d", len(backend.payloads), len(backend.images))
+	}
+	var response map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &response)
+	var types []string
+	for _, raw := range sliceAny(response["output"]) {
+		types = append(types, stringValue(mapAny(raw)["type"])+":"+stringValue(mapAny(raw)["name"]))
+	}
+	if strings.Join(types, ",") != "function_call:lookup,image_generation_call:" {
+		t.Fatalf("output = %v", types)
+	}
+	// Only the caller's own call waits for an output; the drawing is answered.
+	if missing := unansweredCalls(s.responses.get("resp_1").Context); strings.Join(missing, ",") != "call_fc_2" {
+		t.Fatalf("unanswered calls = %v", missing)
+	}
+}
+
+func TestImagegenResponseAnswersCallsMadeAtTheRoundLimit(t *testing.T) {
+	backend := &scriptedBackend{rounds: [][]map[string]any{
+		roundEvents("resp_1", imagegenCall("fc_1", `{"prompt":"a red cube"}`)),
+		// The last round forbids tools, yet the model calls imagegen again.
+		roundEvents("resp_2", imagegenCall("fc_2", `{"prompt":"a blue cube"}`)),
+	}}
+	s := newImagegenServer(backend)
+	recorder := postJSON(t, s, "/imagegen/v1/responses", map[string]any{
+		"input": "draw cubes", "tools": []any{map[string]any{"type": "image_generation"}}, "max_tool_calls": 1,
+	})
+	if recorder.Code != 200 {
+		t.Fatalf("status = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if len(backend.payloads) != 2 || len(backend.images) != 1 || backend.payloads[1]["tool_choice"] != "none" {
+		t.Fatalf("rounds = %d draws = %d last tool_choice = %v", len(backend.payloads), len(backend.images), backend.payloads[1]["tool_choice"])
+	}
+	if missing := unansweredCalls(s.responses.get("resp_1").Context); len(missing) != 0 {
+		t.Fatalf("unanswered calls = %v", missing)
+	}
+}
+
+func TestImagegenResponseDefaultsToEightDraws(t *testing.T) {
+	var rounds [][]map[string]any
+	for i := 0; i < imagegenMaxDraws; i++ {
+		rounds = append(rounds, roundEvents("resp_"+string(rune('a'+i)), imagegenCall("fc_"+string(rune('a'+i)), `{"prompt":"a cube"}`)))
+	}
+	backend := &scriptedBackend{rounds: append(rounds, roundEvents("resp_z", assistantText("msg_1", "Done.")))}
+	s := newImagegenServer(backend)
+	recorder := postJSON(t, s, "/imagegen/v1/responses", map[string]any{"input": "draw cubes", "tools": []any{map[string]any{"type": "image_generation"}}})
+	if recorder.Code != 200 || len(backend.images) != imagegenMaxDraws || len(backend.payloads) != imagegenMaxDraws+1 {
+		t.Fatalf("status = %d draws = %d rounds = %d", recorder.Code, len(backend.images), len(backend.payloads))
+	}
+}
+
 func TestImagegenResponseWithoutImageToolUsesTheUsualPath(t *testing.T) {
 	backend := &scriptedBackend{rounds: [][]map[string]any{roundEvents("resp_1", assistantText("msg_1", "hi"))}}
 	s := newImagegenServer(backend)

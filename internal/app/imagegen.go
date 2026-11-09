@@ -40,9 +40,20 @@ const (
 	imagegenToolName = "imagegen"
 	// imagegenMaxEditImages is the CLI's limit on the pictures one call edits.
 	imagegenMaxEditImages = 5
-	// imagegenMaxRounds bounds the model → draw → model loop of one response.
-	imagegenMaxRounds = 8
+	// imagegenMaxDraws bounds the drawings of one response when the caller sets
+	// no max_tool_calls.
+	imagegenMaxDraws = 8
+	// imagegenMaxRounds bounds the model → draw → model loop of one response,
+	// whatever max_tool_calls says.
+	imagegenMaxRounds = 16
 )
+
+// callerCallTypes are output items only the caller can answer. A round that
+// yields one ends the run, so the caller can send its output back.
+var callerCallTypes = map[string]bool{
+	"function_call": true, "custom_tool_call": true, "local_shell_call": true,
+	"shell_call": true, "apply_patch_call": true, "computer_call": true,
+}
 
 // imagegenRoute strips the /imagegen prefix from a request path. It reports
 // whether the request asked for the Images-endpoint drawing path.
@@ -301,7 +312,7 @@ func (s *server) imagegenResponse(w http.ResponseWriter, r *http.Request, prepar
 		base: sliceAny(downstream["input"]), limit: intValue(downstream["max_tool_calls"]),
 	}
 	if run.limit <= 0 {
-		run.limit = imagegenMaxRounds
+		run.limit = imagegenMaxDraws
 	}
 	var flusher http.Flusher
 	if stream {
@@ -363,22 +374,34 @@ func (run *imagegenRun) do(ctx context.Context, downstream map[string]any) (map[
 	if mapAny(choice)["type"] == "image_generation" {
 		choice = map[string]any{"type": "function", "name": imagegenToolName}
 	}
+	// Every drawing round is followed by one more, in which the model answers.
+	rounds := min(run.limit+1, imagegenMaxRounds)
 	for round := 0; ; round++ {
+		last := round+1 >= rounds
+		if last {
+			choice = "none"
+		}
 		payload := cloneMap(downstream)
 		// Codex refuses max_tool_calls; the run keeps that limit itself.
 		delete(payload, "max_tool_calls")
 		payload["tools"] = tools
 		payload["tool_choice"] = choice
 		payload["input"] = append(cloneSlice(run.base), run.context...)
-		final, calls, err := run.round(ctx, payload, round)
+		final, calls, callerWaits, err := run.round(ctx, payload, round)
 		if err != nil {
 			return nil, err
 		}
-		if len(calls) == 0 || round+1 >= imagegenMaxRounds {
-			return run.finish(final), nil
-		}
+		// Every imagegen call is answered before the run ends, so a follow-up's
+		// stored context never holds a call without its output.
 		for _, call := range calls {
+			if last {
+				run.answer(call, "Not run: this response has reached its drawing limit.")
+				continue
+			}
 			run.draw(ctx, call)
+		}
+		if len(calls) == 0 || last || callerWaits {
+			return run.finish(final), nil
 		}
 		// A forced call is answered; the model now finishes in its own words.
 		choice = "auto"
@@ -390,13 +413,11 @@ func (run *imagegenRun) do(ctx context.Context, downstream map[string]any) (map[
 
 // round streams one /codex/responses call. Ordinary output reaches the client
 // as it arrives, renumbered into the run's output; the model's imagegen calls
-// are held back and returned.
-func (run *imagegenRun) round(ctx context.Context, payload map[string]any, round int) (map[string]any, []map[string]any, error) {
-	var final map[string]any
-	var calls []map[string]any
+// are held back and returned. callerWaits reports a call the caller must answer.
+func (run *imagegenRun) round(ctx context.Context, payload map[string]any, round int) (final map[string]any, calls []map[string]any, callerWaits bool, err error) {
 	held := map[string]bool{}
 	indexes := map[int]int{}
-	err := run.s.backend.stream(ctx, payload, func(event map[string]any) error {
+	err = run.s.backend.stream(ctx, payload, func(event map[string]any) error {
 		eventType := stringValue(event["type"])
 		switch eventType {
 		case "response.created", "response.in_progress", "response.queued":
@@ -431,6 +452,7 @@ func (run *imagegenRun) round(ctx context.Context, payload map[string]any, round
 			return nil
 		}
 		if eventType == "response.output_item.done" && item != nil {
+			callerWaits = callerWaits || callerCallTypes[stringValue(item["type"])]
 			if normalized := normalizeInputItem(item); normalized != nil {
 				run.context = append(run.context, normalized)
 			}
@@ -450,22 +472,25 @@ func (run *imagegenRun) round(ctx context.Context, payload map[string]any, round
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	if final == nil {
-		return nil, nil, &backendError{502, "Codex stream closed before the response completed."}
+		return nil, nil, false, &backendError{502, "Codex stream closed before the response completed."}
 	}
 	run.usage = addUsage(run.usage, mapAny(final["usage"]))
-	return final, calls, nil
+	return final, calls, callerWaits, nil
+}
+
+// answer gives the model the output of one of its imagegen calls.
+func (run *imagegenRun) answer(call map[string]any, output any) {
+	callID := stringValue(valueOr(call["call_id"], call["id"]))
+	run.context = append(run.context, map[string]any{"type": "function_call_output", "call_id": callID, "output": output})
 }
 
 // draw answers one imagegen call: the picture goes to the client as an
 // image_generation_call item, and back to the model as the call's output.
 func (run *imagegenRun) draw(ctx context.Context, call map[string]any) {
-	callID := stringValue(valueOr(call["call_id"], call["id"]))
-	answer := func(output any) {
-		run.context = append(run.context, map[string]any{"type": "function_call_output", "call_id": callID, "output": output})
-	}
+	answer := func(output any) { run.answer(call, output) }
 	var args struct {
 		Prompt                 string `json:"prompt"`
 		TransparentBackground  bool   `json:"transparent_background"`
