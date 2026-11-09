@@ -621,6 +621,10 @@ client = OpenAI(base_url="http://127.0.0.1:8080/imagegen/v1", api_key="...")
   output, and lets the model finish. The model chooses up to five recent
   conversation images to edit (`num_last_images_to_include`). `max_tool_calls`
   bounds the drawings; without it a response draws at most eight.
+- `output_format` must be `png` (or omitted): the CLI's request has no format
+  field, so `jpeg` and `webp` are refused with a 400 rather than silently drawn
+  as PNG. Use `/v1` for them. A drawing round ends early, without another model
+  turn, when the model also calls one of the caller's own tools.
 - The response reports the `quality` and `size` the endpoint actually used; it
   has been seen to ignore requested values. The server logs each draw as
   `codex.imagegen.done ... quality=... size=...`.

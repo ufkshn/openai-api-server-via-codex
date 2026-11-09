@@ -110,9 +110,19 @@ func (b *backend) imagesCall(ctx context.Context, edit bool, body map[string]any
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 128<<20)).Decode(&doc); err != nil {
 		return nil, &backendError{502, "Codex images response was not valid JSON."}
 	}
-	if len(sliceAny(doc["data"])) == 0 {
+	// Only base64 pictures can be passed on; an entry without one (a URL, say)
+	// is dropped, so every caller may read data[0].b64_json.
+	var pictures []any
+	for _, raw := range sliceAny(doc["data"]) {
+		if stringValue(mapAny(raw)["b64_json"]) != "" {
+			pictures = append(pictures, raw)
+		}
+	}
+	if len(pictures) == 0 {
+		log.Printf("codex.imagegen.error path=%s status=no_image account=%s seconds=%.1f", path, lease.id(), time.Since(started).Seconds())
 		return nil, &backendError{502, "Codex images response carried no image."}
 	}
+	doc["data"] = pictures
 	log.Printf(
 		"codex.imagegen.done path=%s account=%s images=%d quality=%s size=%s background=%s seconds=%.1f request_id=%s",
 		path, lease.id(), len(sliceAny(doc["data"])), stringValue(doc["quality"]), stringValue(doc["size"]),
@@ -162,6 +172,10 @@ func (s *server) imagegenImages(w http.ResponseWriter, r *http.Request, edit boo
 	if len(dataURLList(body["mask"])) > 0 {
 		log.Printf("codex.imagegen.mask_fallback path=hosted_tool")
 		s.serveImages(w, r, body, edit)
+		return
+	}
+	if err := imagegenFormatError(body); err != nil {
+		writeError(w, 400, err.Message, "invalid_request_error", strPtr(err.Param), nil)
 		return
 	}
 	count := intValue(body["n"])
@@ -314,6 +328,10 @@ func (s *server) imagegenResponse(w http.ResponseWriter, r *http.Request, prepar
 	if run.limit <= 0 {
 		run.limit = imagegenMaxDraws
 	}
+	if err := imagegenFormatError(run.settings); err != nil {
+		writeError(w, 400, err.Message, "invalid_request_error", strPtr("tools"), nil)
+		return
+	}
 	var flusher http.Flusher
 	if stream {
 		setSSE(w)
@@ -415,7 +433,17 @@ func (run *imagegenRun) do(ctx context.Context, downstream map[string]any) (map[
 // as it arrives, renumbered into the run's output; the model's imagegen calls
 // are held back and returned. callerWaits reports a call the caller must answer.
 func (run *imagegenRun) round(ctx context.Context, payload map[string]any, round int) (final map[string]any, calls []map[string]any, callerWaits bool, err error) {
+	// An imagegen call is held by its item id and by its upstream output_index:
+	// either alone can be missing from an event.
 	held := map[string]bool{}
+	heldIndexes := map[int]bool{}
+	isHeld := func(event map[string]any) bool {
+		if id := stringValue(event["item_id"]); id != "" && held[id] {
+			return true
+		}
+		raw, ok := event["output_index"]
+		return ok && raw != nil && heldIndexes[intValue(raw)]
+	}
 	indexes := map[int]int{}
 	err = run.s.backend.stream(ctx, payload, func(event map[string]any) error {
 		eventType := stringValue(event["type"])
@@ -441,14 +469,19 @@ func (run *imagegenRun) round(ctx context.Context, payload map[string]any, round
 		}
 		item := mapAny(event["item"])
 		if isImagegenCall(item) {
-			held[stringValue(item["id"])] = true
+			if id := stringValue(item["id"]); id != "" {
+				held[id] = true
+			}
+			if raw, ok := event["output_index"]; ok && raw != nil {
+				heldIndexes[intValue(raw)] = true
+			}
 			if eventType == "response.output_item.done" {
 				calls = append(calls, cloneMap(item))
 				run.context = append(run.context, normalizeInputItem(item))
 			}
 			return nil
 		}
-		if held[stringValue(event["item_id"])] {
+		if isHeld(event) {
 			return nil
 		}
 		if eventType == "response.output_item.done" && item != nil {
@@ -544,7 +577,7 @@ func (run *imagegenRun) draw(ctx context.Context, call map[string]any) {
 				item[key] = value
 			}
 		}
-		answer([]any{map[string]any{"type": "input_image", "image_url": "data:image/png;base64," + b64, "detail": "high"}})
+		answer([]any{map[string]any{"type": "input_image", "image_url": imageDataURL(item["output_format"], b64), "detail": "high"}})
 	}
 	run.outputs = append(run.outputs, item)
 	run.forward(map[string]any{"type": "response.output_item.done", "output_index": index, "item": item})
@@ -605,7 +638,7 @@ func recentImages(items []any, n int) []string {
 		switch {
 		case item["type"] == "image_generation_call":
 			if result := stringValue(item["result"]); result != "" {
-				found = append(found, "data:image/png;base64,"+result)
+				found = append(found, imageDataURL(item["output_format"], result))
 			}
 			continue
 		case item["type"] == "function_call_output":
@@ -631,6 +664,28 @@ func recentImages(items []any, n int) []string {
 		found[i], found[j] = found[j], found[i]
 	}
 	return found
+}
+
+// imageDataURL wraps a base64 picture in a data URL of its real format.
+func imageDataURL(format any, b64 string) string {
+	mime := strings.ToLower(stringValue(format))
+	switch mime {
+	case "", "png":
+		mime = "png"
+	case "jpg":
+		mime = "jpeg"
+	}
+	return "data:image/" + mime + ";base64," + b64
+}
+
+// imagegenFormatError refuses an output_format other than png: the Images
+// endpoint's request, as the CLI sends it, has no format field, so honouring
+// one cannot be promised. /v1 draws with the hosted tool, which takes it.
+func imagegenFormatError(settings map[string]any) *imageValidationError {
+	if format := stringValue(settings["output_format"]); format != "" && format != "png" {
+		return &imageValidationError{"output_format must be png on /imagegen/v1; use /v1 for jpeg or webp.", "output_format"}
+	}
+	return nil
 }
 
 // addUsage sums two usage objects field by field, nested details included.

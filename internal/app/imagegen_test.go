@@ -378,3 +378,89 @@ func TestRecentImagesCountsNewestFirstAndReturnsOldestFirst(t *testing.T) {
 		t.Fatalf("recent 9 = %v", got)
 	}
 }
+
+func imagesUpstreamBackend(t *testing.T, data []any) *backend {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"created": 1700000000, "output_format": "png", "data": data})
+	}))
+	t.Cleanup(upstream.Close)
+	cfg := defaultConfig()
+	cfg.BackendURL = upstream.URL
+	cfg.AuthJSON = writeTestAuth(t, authDocument("access", map[string]any{"account_id": "acct_imagegen"}))
+	return newBackend(cfg)
+}
+
+func TestImagegenImagesStreamWithoutBase64FailsInsteadOfPanicking(t *testing.T) {
+	s := newImagegenServer(imagesUpstreamBackend(t, []any{map[string]any{"url": "https://example.test/picture.png"}}))
+	recorder := postJSON(t, s, "/imagegen/v1/images/generations", map[string]any{"prompt": "a cube", "stream": true})
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"type":"error"`) || !strings.Contains(body, "carried no image") || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("status = %d body = %s", recorder.Code, body)
+	}
+}
+
+func TestImagegenImagesKeepOnlyBase64Pictures(t *testing.T) {
+	s := newImagegenServer(imagesUpstreamBackend(t, []any{
+		map[string]any{"url": "https://example.test/picture.png"}, map[string]any{"b64_json": "QQ=="},
+	}))
+	recorder := postJSON(t, s, "/imagegen/v1/images/generations", map[string]any{"prompt": "a cube"})
+	var result map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &result)
+	if data := sliceAny(result["data"]); recorder.Code != 200 || len(data) != 1 || mapAny(data[0])["b64_json"] != "QQ==" {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestImagegenRefusesOutputFormatItCannotHonour(t *testing.T) {
+	backend := &scriptedBackend{}
+	s := newImagegenServer(backend)
+	for _, request := range []struct {
+		path string
+		body map[string]any
+	}{
+		{"/imagegen/v1/images/generations", map[string]any{"prompt": "a cube", "output_format": "jpeg"}},
+		{"/imagegen/v1/responses", map[string]any{"input": "a cube", "stream": true, "tools": []any{map[string]any{"type": "image_generation", "output_format": "webp"}}}},
+	} {
+		recorder := postJSON(t, s, request.path, request.body)
+		if recorder.Code != 400 || !strings.Contains(recorder.Body.String(), "use /v1 for jpeg or webp") {
+			t.Fatalf("%s: status = %d body = %s", request.path, recorder.Code, recorder.Body.String())
+		}
+	}
+	if len(backend.payloads) != 0 || len(backend.images) != 0 {
+		t.Fatal("a refused request reached Codex")
+	}
+	// png, the only format the endpoint is known to return, is still accepted.
+	if recorder := postJSON(t, s, "/imagegen/v1/images/generations", map[string]any{"prompt": "a cube", "output_format": "png"}); recorder.Code != 200 {
+		t.Fatalf("png: status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestImagegenCallWithoutItemIDHidesOnlyItsOwnEvents(t *testing.T) {
+	backend := &scriptedBackend{rounds: [][]map[string]any{
+		roundEvents("resp_1", imagegenCall("", `{"prompt":"a red cube"}`), assistantText("msg_0", "Drawing.")),
+		roundEvents("resp_2", assistantText("msg_1", "Done.")),
+	}}
+	s := newImagegenServer(backend)
+	recorder := postJSON(t, s, "/imagegen/v1/responses", map[string]any{"input": "draw a red cube", "tools": []any{map[string]any{"type": "image_generation"}}})
+	var response map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &response)
+	var types []string
+	for _, raw := range sliceAny(response["output"]) {
+		types = append(types, stringValue(mapAny(raw)["type"]))
+	}
+	if strings.Join(types, ",") != "message,image_generation_call,message" {
+		t.Fatalf("status = %d output = %v", recorder.Code, types)
+	}
+}
+
+func TestImageDataURLUsesTheRealFormat(t *testing.T) {
+	items := []any{map[string]any{"type": "image_generation_call", "result": "QQ==", "output_format": "jpeg"}}
+	if got := recentImages(items, 1); got[0] != "data:image/jpeg;base64,QQ==" {
+		t.Fatalf("recent = %v", got)
+	}
+	if imageDataURL(nil, "QQ==") != "data:image/png;base64,QQ==" || imageDataURL("jpg", "QQ==") != "data:image/jpeg;base64,QQ==" {
+		t.Fatal("imageDataURL defaults")
+	}
+}
