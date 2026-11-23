@@ -248,3 +248,32 @@ func TestResponseToChatMapsCachedAndReasoningTokens(t *testing.T) {
 		t.Fatalf("details invented without upstream breakdown: %#v", bare)
 	}
 }
+
+func TestChatToResponseCarriesFilesAndImageDetail(t *testing.T) {
+	pdf := "data:application/pdf;base64,JVBERi0xLjQK"
+	body := map[string]any{
+		"model": "gpt-test",
+		"messages": []any{map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "read these"},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA==", "detail": "high"}},
+			map[string]any{"type": "file", "file": map[string]any{"filename": "report.pdf", "file_data": pdf}},
+			map[string]any{"type": "file", "file": map[string]any{"file_id": "file-123"}},
+		}}},
+	}
+	content := sliceAny(mapAny(sliceAny(chatToResponse(body, defaultModel)["input"])[0])["content"])
+	if len(content) != 4 {
+		t.Fatalf("content = %#v", content)
+	}
+	image := mapAny(content[1])
+	if image["type"] != "input_image" || image["image_url"] != "data:image/png;base64,AA==" || image["detail"] != "high" {
+		t.Fatalf("image = %#v", image)
+	}
+	file := mapAny(content[2])
+	if file["type"] != "input_file" || file["filename"] != "report.pdf" || file["file_data"] != pdf {
+		t.Fatalf("file = %#v", file)
+	}
+	byID := mapAny(content[3])
+	if byID["type"] != "input_file" || byID["file_id"] != "file-123" || byID["file_data"] != nil {
+		t.Fatalf("file by id = %#v", byID)
+	}
+}

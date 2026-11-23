@@ -319,11 +319,27 @@ func chatContent(value any) any {
 			parts = append(parts, map[string]any{"type": "input_text", "text": stringValue(p["text"])})
 		case "image_url":
 			u := p["image_url"]
+			part := map[string]any{"type": "input_image"}
 			if m := mapAny(u); m != nil {
 				u = m["url"]
+				if detail, ok := m["detail"].(string); ok && detail != "" {
+					part["detail"] = detail
+				}
 			}
-			parts = append(parts, map[string]any{"type": "input_image", "image_url": u})
-		case "input_image":
+			part["image_url"] = u
+			parts = append(parts, part)
+		case "file":
+			// Chat Completions' file part (a PDF as a data URL in file_data, or a file_id) is the
+			// Responses API's input_file; dropping it answered as if nothing had been attached.
+			f := mapAny(p["file"])
+			part := map[string]any{"type": "input_file"}
+			for _, key := range []string{"file_data", "file_id", "filename"} {
+				if v, ok := f[key].(string); ok && v != "" {
+					part[key] = v
+				}
+			}
+			parts = append(parts, part)
+		case "input_image", "input_file":
 			parts = append(parts, cloneMap(p))
 		}
 	}
