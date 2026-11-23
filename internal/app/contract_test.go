@@ -164,6 +164,9 @@ func TestGoHTTPContractResponsesLifecycleAndStreaming(t *testing.T) {
 	if len(modelData) != 1 || mapAny(modelData[0])["id"] != "gpt-5.6-luna" {
 		t.Fatalf("models = %#v", models)
 	}
+	if luna := mapAny(modelData[0]); luna["context_window"] != float64(272000) || luna["max_context_window"] != float64(872000) || luna["display_name"] != "GPT-5.6 Luna" {
+		t.Fatalf("model limits = %#v", luna)
+	}
 
 	created := environment.json(t, http.MethodPost, "/v1/responses", map[string]any{
 		"model": "gpt-5.6-luna",
@@ -1476,7 +1479,7 @@ func (f faultBackend) stream(context.Context, map[string]any, func(map[string]an
 func (f faultBackend) collect(context.Context, map[string]any) (map[string]any, error) {
 	return nil, f.err
 }
-func (f faultBackend) listModels(context.Context) []string { return nil }
+func (f faultBackend) listModels(context.Context) []modelInfo { return nil }
 func (f faultBackend) proxy(context.Context, string, string, string, http.Header, io.Reader) (*http.Response, error) {
 	return nil, f.err
 }

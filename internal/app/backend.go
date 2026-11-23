@@ -807,7 +807,47 @@ func (b *backend) collect(ctx context.Context, payload map[string]any) (map[stri
 	return nil, responseFailure(failure)
 }
 
-func (b *backend) listModels(ctx context.Context) []string {
+// modelInfo is one entry of the upstream Codex model catalog. The limits are
+// zero when the catalog does not give them as positive integers: a guessed
+// number would be worse for clients than none.
+type modelInfo struct {
+	ID               string
+	DisplayName      string
+	ContextWindow    int
+	MaxContextWindow int
+}
+
+func defaultModelInfos() []modelInfo {
+	result := make([]modelInfo, len(defaultModels))
+	for i, id := range defaultModels {
+		result[i] = modelInfo{ID: id}
+	}
+	return result
+}
+
+// positiveJSONInt accepts only JSON numbers that are whole and above zero, so a
+// string, a fraction or a missing value never becomes a token limit.
+func positiveJSONInt(value any) int {
+	var f float64
+	switch v := value.(type) {
+	case float64:
+		f = v
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return 0
+		}
+		f = float64(n)
+	default:
+		return 0
+	}
+	if f <= 0 || f != math.Trunc(f) || f > math.MaxInt32 {
+		return 0
+	}
+	return int(f)
+}
+
+func (b *backend) listModels(ctx context.Context) []modelInfo {
 	resp, _, err := b.doAuthenticated(routeHints{}, func(lease *accountLease) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.cfg.BackendURL+"/models?client_version="+url.QueryEscape(b.cfg.ClientVersion), nil)
 		if err != nil {
@@ -818,24 +858,30 @@ func (b *backend) listModels(ctx context.Context) []string {
 	})
 	if err != nil {
 		b.debugf("codex.models.fallback reason=request_or_auth_error")
-		return append([]string(nil), defaultModels...)
+		return defaultModelInfos()
 	}
 	defer resp.Body.Close()
 	var doc map[string]any
 	if resp.StatusCode/100 != 2 || json.NewDecoder(resp.Body).Decode(&doc) != nil {
 		b.debugf("codex.models.fallback reason=invalid_response status=%d", resp.StatusCode)
-		return append([]string(nil), defaultModels...)
+		return defaultModelInfos()
 	}
-	var result []string
+	var result []modelInfo
 	for _, raw := range sliceAny(doc["models"]) {
 		model := mapAny(raw)
 		if boolValue(model["supported_in_api"]) && model["visibility"] == "list" && stringValue(model["slug"]) != "" {
-			result = append(result, stringValue(model["slug"]))
+			displayName, _ := model["display_name"].(string)
+			result = append(result, modelInfo{
+				ID:               stringValue(model["slug"]),
+				DisplayName:      displayName,
+				ContextWindow:    positiveJSONInt(model["context_window"]),
+				MaxContextWindow: positiveJSONInt(model["max_context_window"]),
+			})
 		}
 	}
 	if len(result) == 0 {
 		b.debugf("codex.models.fallback reason=empty_model_list")
-		return append([]string(nil), defaultModels...)
+		return defaultModelInfos()
 	}
 	b.debugf("codex.models.loaded count=%d", len(result))
 	return result

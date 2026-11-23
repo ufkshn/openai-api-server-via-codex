@@ -59,7 +59,7 @@ func (s *server) accountPool() *accountPool {
 type codexBackend interface {
 	stream(context.Context, map[string]any, func(map[string]any) error) error
 	collect(context.Context, map[string]any) (map[string]any, error)
-	listModels(context.Context) []string
+	listModels(context.Context) []modelInfo
 	proxy(context.Context, string, string, string, http.Header, io.Reader) (*http.Response, error)
 	transcribe(context.Context, http.Header, io.Reader) (*http.Response, error)
 	imagesCall(context.Context, bool, map[string]any) (map[string]any, error)
@@ -344,10 +344,22 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release()
-	ids := s.backend.listModels(r.Context())
-	data := make([]any, len(ids))
-	for i, id := range ids {
-		data[i] = map[string]any{"id": id, "object": "model", "created": 0, "owned_by": "codex"}
+	models := s.backend.listModels(r.Context())
+	data := make([]any, len(models))
+	for i, model := range models {
+		entry := map[string]any{"id": model.ID, "object": "model", "created": 0, "owned_by": "codex"}
+		// Extra fields beyond OpenAI's shape: context_window is the total token
+		// window input and output share, as the Codex catalog reports it.
+		if model.ContextWindow > 0 {
+			entry["context_window"] = model.ContextWindow
+		}
+		if model.MaxContextWindow > 0 {
+			entry["max_context_window"] = model.MaxContextWindow
+		}
+		if model.DisplayName != "" {
+			entry["display_name"] = model.DisplayName
+		}
+		data[i] = entry
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }

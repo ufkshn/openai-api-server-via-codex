@@ -94,8 +94,8 @@ func (s *Server) handle(w http.ResponseWriter, request *http.Request) {
 	switch {
 	case request.Method == http.MethodGet && request.URL.Path == "/backend-api/codex/models":
 		writeJSON(w, map[string]any{"models": []any{
-			map[string]any{"slug": "gpt-5.6-luna", "supported_in_api": true, "visibility": "list"},
-			map[string]any{"slug": "hidden-model", "supported_in_api": true, "visibility": "hidden"},
+			map[string]any{"slug": "gpt-5.6-luna", "display_name": "GPT-5.6 Luna", "supported_in_api": true, "visibility": "list", "context_window": 272000, "max_context_window": 872000},
+			map[string]any{"slug": "hidden-model", "supported_in_api": true, "visibility": "hidden", "context_window": 500000},
 			map[string]any{"slug": "unsupported-model", "supported_in_api": false, "visibility": "list"},
 		}})
 	case request.Method == http.MethodPost && request.URL.Path == "/backend-api/codex/responses":

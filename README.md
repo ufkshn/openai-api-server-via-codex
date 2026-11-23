@@ -676,6 +676,16 @@ Transient failures are retried before any output reaches the client
 Model listing is best-effort. A model can sometimes accept direct requests even
 when it is absent from the upstream catalog returned by `/v1/models`.
 
+Each `/v1/models` entry keeps OpenAI's shape and adds the limits Codex's own
+catalog reports, when it reports them as positive integers: `context_window`
+(the total token window that input and output share), `max_context_window`, and
+`display_name`. When the upstream catalog cannot be read, the built-in fallback
+list is returned without these fields; no limits are guessed.
+
+```json
+{"id":"gpt-6.2-sol","object":"model","created":0,"owned_by":"codex","context_window":500000,"max_context_window":872000,"display_name":"GPT-6.2 Sol"}
+```
+
 </details>
 
 <details>

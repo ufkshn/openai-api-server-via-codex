@@ -39,7 +39,7 @@ func (b *scriptedBackend) stream(_ context.Context, payload map[string]any, fn f
 func (b *scriptedBackend) collect(context.Context, map[string]any) (map[string]any, error) {
 	panic("collect is not used by the imagegen path")
 }
-func (b *scriptedBackend) listModels(context.Context) []string { return nil }
+func (b *scriptedBackend) listModels(context.Context) []modelInfo { return nil }
 func (b *scriptedBackend) proxy(context.Context, string, string, string, http.Header, io.Reader) (*http.Response, error) {
 	panic("proxy is not used by the imagegen path")
 }

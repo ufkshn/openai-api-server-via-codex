@@ -223,7 +223,7 @@ func TestBackendReloadsExternalAuthBeforeRetryingModels(t *testing.T) {
 	defer upstream.Close()
 
 	models := retryTestBackend(t, upstream, authPath).listModels(context.Background())
-	if calls.Load() != 2 || len(models) != 1 || models[0] != "gpt-reloaded" {
+	if calls.Load() != 2 || len(models) != 1 || models[0].ID != "gpt-reloaded" {
 		t.Fatalf("calls = %d, models = %#v", calls.Load(), models)
 	}
 }
