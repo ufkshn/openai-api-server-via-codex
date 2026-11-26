@@ -406,6 +406,25 @@ func responseText(response map[string]any) string {
 	return b.String()
 }
 
+// reasoningSummary is the text of the reasoning summaries in a response, the
+// parts a blank line apart, as the stream sends them in reasoning_content. It
+// is empty unless the request asked for a summary.
+func reasoningSummary(response map[string]any) string {
+	var parts []string
+	for _, raw := range sliceAny(response["output"]) {
+		item := mapAny(raw)
+		if item["type"] != "reasoning" {
+			continue
+		}
+		for _, part := range sliceAny(item["summary"]) {
+			if text := stringValue(mapAny(part)["text"]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 func usesLegacyFunctions(body map[string]any) bool {
 	if len(sliceAny(body["tools"])) > 0 {
 		return false
@@ -444,6 +463,9 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 	message := map[string]any{"role": "assistant", "content": text}
 	if text == "" && (legacyCall != nil || len(toolCalls) > 0) {
 		message["content"] = nil
+	}
+	if reasoning := reasoningSummary(response); reasoning != "" {
+		message["reasoning_content"] = reasoning
 	}
 	finish := "stop"
 	if legacyCall != nil {

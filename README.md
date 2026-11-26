@@ -479,6 +479,30 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="")
 ```
 
+Chat Completions has no field for reasoning. To follow the model's thinking
+while it works, ask for a reasoning summary with the Responses `reasoning`
+object; the summary is streamed as `delta.reasoning_content` before the first
+text or tool call (and returned as `message.reasoning_content` without
+`stream`). Nothing is added to a request that does not ask for it:
+
+```python
+stream = client.chat.completions.create(
+    model="gpt-6-luna",
+    messages=[{"role": "user", "content": "Plan a short trip."}],
+    stream=True,
+    extra_body={"reasoning": {"effort": "low", "summary": "auto"}},
+)
+
+for chunk in stream:
+    if not chunk.choices:
+        continue
+    delta = chunk.choices[0].delta
+    if thought := getattr(delta, "reasoning_content", None):
+        print(thought, end="")
+    if delta.content:
+        print(delta.content, end="")
+```
+
 </details>
 
 <details>

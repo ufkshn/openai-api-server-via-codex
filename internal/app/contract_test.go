@@ -1389,6 +1389,84 @@ func TestGoHTTPContractChatStreamsToolArgumentsSentWithoutDeltas(t *testing.T) {
 	}
 }
 
+// A client that asks Chat Completions for a reasoning summary (reasoning.summary)
+// reads it as delta.reasoning_content while the model thinks, before the first
+// text or tool call; one that does not ask gets the stream it always got.
+func TestGoHTTPContractChatStreamsRequestedReasoningSummary(t *testing.T) {
+	environment := newContractEnvironment(t, nil)
+	stream := func(body map[string]any) (reasoning, content, arguments string, order []string) {
+		body["model"], body["stream"] = "gpt-6-sol", true
+		_, data := environment.request(t, http.MethodPost, "/v1/chat/completions", body)
+		note := func(kind string) {
+			if len(order) == 0 || order[len(order)-1] != kind {
+				order = append(order, kind)
+			}
+		}
+		for _, event := range parseSSE(t, data) {
+			for _, choice := range sliceAny(event["choices"]) {
+				delta := mapAny(mapAny(choice)["delta"])
+				if text := stringValue(delta["reasoning_content"]); text != "" {
+					reasoning += text
+					note("reasoning")
+				}
+				if text := stringValue(delta["content"]); text != "" {
+					content += text
+					note("content")
+				}
+				for _, call := range sliceAny(delta["tool_calls"]) {
+					arguments += stringValue(mapAny(mapAny(call)["function"])["arguments"])
+					note("tool")
+				}
+			}
+		}
+		return
+	}
+	question := []any{map[string]any{"role": "user", "content": "think first"}}
+	summary := "**Reading the request**\n\nIt asks for one thing.\n\n**Answering**"
+
+	reasoning, content, _, order := stream(map[string]any{
+		"messages": question, "reasoning": map[string]any{"effort": "low", "summary": "auto"},
+	})
+	if reasoning != summary || !strings.Contains(content, "think first") || strings.Join(order, ",") != "reasoning,content" {
+		t.Fatalf("reasoning = %q, content = %q, order = %v", reasoning, content, order)
+	}
+	upstream := environment.upstream.LastResponseRequest(t)
+	if asked := mapAny(upstream.JSON["reasoning"]); asked["summary"] != "auto" || asked["effort"] != "low" {
+		t.Fatalf("upstream reasoning = %#v", upstream.JSON["reasoning"])
+	}
+
+	// Before a tool call too, whose index is still 0 for the client.
+	reasoning, _, arguments, order := stream(map[string]any{
+		"messages": question, "reasoning": map[string]any{"summary": "auto"},
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+			"name": "lookup_weather", "parameters": map[string]any{"type": "object"},
+		}}},
+	})
+	if reasoning != summary || arguments != `{"city":"Tokyo"}` || strings.Join(order, ",") != "reasoning,tool" {
+		t.Fatalf("reasoning = %q, arguments = %q, order = %v", reasoning, arguments, order)
+	}
+
+	// Not asked for: nothing of it in the stream.
+	if reasoning, content, _, _ := stream(map[string]any{"messages": question, "reasoning_effort": "low"}); reasoning != "" || content == "" {
+		t.Fatalf("unasked reasoning = %q, content = %q", reasoning, content)
+	}
+
+	// The whole completion carries it in the message, beside the answer.
+	document := environment.json(t, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "gpt-6-sol", "messages": question, "reasoning": map[string]any{"summary": "auto"},
+	}, http.StatusOK)
+	message := mapAny(mapAny(sliceAny(document["choices"])[0])["message"])
+	if message["reasoning_content"] != summary || !strings.Contains(stringValue(message["content"]), "think first") {
+		t.Fatalf("message = %#v", message)
+	}
+	plain := environment.json(t, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "gpt-6-sol", "messages": question,
+	}, http.StatusOK)
+	if _, has := mapAny(mapAny(sliceAny(plain["choices"])[0])["message"])["reasoning_content"]; has {
+		t.Fatalf("unasked message = %#v", plain)
+	}
+}
+
 func TestGoHTTPContractResponsesKeepsFailedStatusButNeverInventsSuccess(t *testing.T) {
 	environment := newContractEnvironment(t, nil)
 	// Responses can represent failure: the failed response, with its error, is the answer.

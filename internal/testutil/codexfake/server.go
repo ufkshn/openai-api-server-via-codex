@@ -154,9 +154,31 @@ func (s *Server) responses(w http.ResponseWriter, payload map[string]any) {
 			"name": tool["name"], "arguments": `{"city":"Tokyo"}`,
 		}
 	}
+	// A request that asks for a reasoning summary gets one, as Codex sends it: a
+	// reasoning item before the answer's item, its summary in parts with a bold
+	// title each.
+	var reasoning map[string]any
+	summaryParts := []string{"**Reading the request**\n\nIt asks for one thing.", "**Answering**"}
+	at := 0
+	requested, _ := payload["reasoning"].(map[string]any)
+	if summary, _ := requested["summary"].(string); summary != "" && summary != "none" && toolByType(payload, "image_generation") == nil {
+		var summaries []any
+		for _, part := range summaryParts {
+			summaries = append(summaries, map[string]any{"type": "summary_text", "text": part})
+		}
+		reasoning = map[string]any{
+			"id": fmt.Sprintf("rs_go_contract_%d", number), "type": "reasoning",
+			"summary": summaries, "encrypted_content": "fake-encrypted-reasoning",
+		}
+		at = 1
+	}
+	output := []any{item}
+	if reasoning != nil {
+		output = []any{reasoning, item}
+	}
 	response := map[string]any{
 		"id": responseID, "object": "response", "created_at": createdAt,
-		"status": "completed", "model": payload["model"], "output": []any{item},
+		"status": "completed", "model": payload["model"], "output": output,
 		"parallel_tool_calls": true, "tool_choice": valueOr(payload["tool_choice"], "auto"),
 		"tools": slice(payload["tools"]),
 		"usage": map[string]any{
@@ -200,6 +222,35 @@ func (s *Server) responses(w http.ResponseWriter, payload map[string]any) {
 	if strings.Contains(text, "FAKE_UPSTREAM_ERROR") {
 		return
 	}
+	if reasoning != nil {
+		opened := clone(reasoning)
+		opened["summary"] = []any{}
+		delete(opened, "encrypted_content")
+		writeSSE(w, map[string]any{"type": "response.output_item.added", "sequence_number": 1, "output_index": 0, "item": opened})
+		for index, part := range summaryParts {
+			event := func(name string, fields map[string]any) {
+				out := map[string]any{
+					"type": name, "sequence_number": 1,
+					"output_index": 0, "item_id": reasoning["id"], "summary_index": index,
+				}
+				for key, value := range fields {
+					out[key] = value
+				}
+				writeSSE(w, out)
+			}
+			event("response.reasoning_summary_part.added", map[string]any{"part": map[string]any{"type": "summary_text", "text": ""}})
+			// In two deltas, as a real summary arrives in pieces.
+			half := len(part) / 2
+			event("response.reasoning_summary_text.delta", map[string]any{"delta": part[:half]})
+			event("response.reasoning_summary_text.delta", map[string]any{"delta": part[half:]})
+			event("response.reasoning_summary_text.done", map[string]any{"text": part})
+			event("response.reasoning_summary_part.done", map[string]any{"part": map[string]any{"type": "summary_text", "text": part}})
+		}
+		writeSSE(w, map[string]any{"type": "response.output_item.done", "sequence_number": 1, "output_index": 0, "item": reasoning})
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 	if item["type"] == "image_generation_call" {
 		// Codex reports progress and partial frames, but never an
 		// image_generation_call.completed event: the finished image arrives with
@@ -231,24 +282,24 @@ func (s *Server) responses(w http.ResponseWriter, payload map[string]any) {
 		added := clone(item)
 		added["arguments"] = ""
 		added["status"] = "in_progress"
-		writeSSE(w, map[string]any{"type": "response.output_item.added", "sequence_number": 1, "output_index": 0, "item": added})
+		writeSSE(w, map[string]any{"type": "response.output_item.added", "sequence_number": 1, "output_index": at, "item": added})
 		if strings.Contains(text, "FAKE_ARGS_DONE_ONLY") {
 			// Since 2026-10-07 Codex often streams no argument deltas: the arguments
 			// arrive whole in function_call_arguments.done and output_item.done.
-			writeSSE(w, map[string]any{"type": "response.function_call_arguments.done", "sequence_number": 2, "output_index": 0, "item_id": item["id"], "arguments": `{"city":"Tokyo"}`})
+			writeSSE(w, map[string]any{"type": "response.function_call_arguments.done", "sequence_number": 2, "output_index": at, "item_id": item["id"], "arguments": `{"city":"Tokyo"}`})
 		} else if !strings.Contains(text, "FAKE_NO_ARGUMENT_DELTA") {
 			// The real backend sends no argument deltas for parallel tool calls;
 			// FAKE_NO_ARGUMENT_DELTA leaves the arguments to response.output_item.done.
-			writeSSE(w, map[string]any{"type": "response.function_call_arguments.delta", "sequence_number": 2, "output_index": 0, "delta": `{"city":"Tokyo"}`})
+			writeSSE(w, map[string]any{"type": "response.function_call_arguments.delta", "sequence_number": 2, "output_index": at, "delta": `{"city":"Tokyo"}`})
 		}
 	} else if item["type"] == "message" {
 		writeSSE(w, map[string]any{
 			"type": "response.output_text.delta", "sequence_number": 1,
-			"output_index": 0, "content_index": 0, "item_id": item["id"],
+			"output_index": at, "content_index": 0, "item_id": item["id"],
 			"delta": text, "logprobs": []any{},
 		})
 	}
-	writeSSE(w, map[string]any{"type": "response.output_item.done", "sequence_number": 3, "output_index": 0, "item": item})
+	writeSSE(w, map[string]any{"type": "response.output_item.done", "sequence_number": 3, "output_index": at, "item": item})
 	if strings.Contains(text, "FAKE_DELTA_ONLY") {
 		return
 	}

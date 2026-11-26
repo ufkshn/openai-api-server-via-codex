@@ -718,6 +718,21 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 				state.SawText = true
 				emit(chatChunk(state, map[string]any{"content": delta}, nil, nil, nil))
 			}
+		case "response.reasoning_summary_part.added":
+			// Each summary part is a thought of its own: a blank line keeps it
+			// apart from the one before in the text the client reads.
+			if state.SawReasoning {
+				emit(chatChunk(state, map[string]any{"reasoning_content": "\n\n"}, nil, nil, nil))
+			}
+		case "response.reasoning_summary_text.delta":
+			// Chat Completions has no field for reasoning. A summary the client
+			// asked for (reasoning.summary) is streamed as delta.reasoning_content,
+			// the name other OpenAI-compatible servers use; without it a client
+			// sees nothing until the first text or tool call.
+			if delta := stringValue(event["delta"]); delta != "" {
+				state.SawReasoning = true
+				emit(chatChunk(state, map[string]any{"reasoning_content": delta}, nil, nil, nil))
+			}
 		case "response.output_item.added":
 			item := mapAny(event["item"])
 			if item != nil && item["type"] == "function_call" {
@@ -819,6 +834,8 @@ type chatStreamState struct {
 	Model             string
 	ChoiceCount       int
 	RoleSent, SawText bool
+	// SawReasoning is set once a reasoning summary delta went out.
+	SawReasoning bool
 }
 
 // chatStreamToolCall tracks one function_call output item. index numbers tool

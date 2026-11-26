@@ -192,6 +192,59 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
                 "response": created_response,
             }
         ]
+        requested = cast(dict[str, Any], payload.get("reasoning") or {})
+        if requested.get("summary") and not is_tool and not is_image:
+            # Codex sends a requested reasoning summary as a reasoning item before
+            # the answer, in parts with a bold title each.
+            parts = ["**Reading the request**", "**Answering**\n\nIn one line."]
+            reasoning_item = {
+                "id": f"rs_contract_{number}",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": part} for part in parts],
+            }
+            response["output"] = [reasoning_item, item]
+            events.append(
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {**reasoning_item, "summary": []},
+                }
+            )
+            for index, part in enumerate(parts):
+                where = {
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item_id": reasoning_item["id"],
+                    "summary_index": index,
+                }
+                events.extend(
+                    [
+                        {
+                            "type": "response.reasoning_summary_part.added",
+                            **where,
+                            "part": {"type": "summary_text", "text": ""},
+                        },
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            **where,
+                            "delta": part,
+                        },
+                        {
+                            "type": "response.reasoning_summary_part.done",
+                            **where,
+                            "part": {"type": "summary_text", "text": part},
+                        },
+                    ]
+                )
+            events.append(
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": reasoning_item,
+                }
+            )
         if is_tool:
             events.extend(
                 [
@@ -956,6 +1009,53 @@ async def test_contract_chat_raises_upstream_overload(
             pass
     assert streamed.value.status_code == 503
     assert streamed.value.code == "server_is_overloaded"
+
+
+async def test_contract_chat_streams_requested_reasoning_summary(
+    runtime_server: tuple[str, str], contract_client: AsyncOpenAI
+) -> None:
+    runtime, _ = runtime_server
+    messages: Any = [{"role": "user", "content": "think first"}]
+    summary = "**Reading the request**\n\n**Answering**\n\nIn one line."
+
+    async def read(**extra: Any) -> tuple[str, str, list[str]]:
+        stream = await contract_client.chat.completions.create(
+            model="gpt-5.6-luna", messages=messages, stream=True, **extra
+        )
+        reasoning, content, order = "", "", []
+        async for chunk in stream:
+            for choice in chunk.choices:
+                # reasoning_content is not in the SDK's types: it reads as an extra field.
+                thought = getattr(choice.delta, "reasoning_content", None)
+                if thought:
+                    reasoning += thought
+                    order.append("reasoning")
+                if choice.delta.content:
+                    content += choice.delta.content
+                    order.append("content")
+        return reasoning, content, order
+
+    reasoning, content, order = await read(
+        extra_body={"reasoning": {"effort": "low", "summary": "auto"}}
+    )
+    assert reasoning == summary, runtime
+    assert "think first" in content, runtime
+    assert order == sorted(order, reverse=True), (
+        runtime
+    )  # every thought before the answer
+
+    # Not asked for: the stream a client always got.
+    reasoning, content, _ = await read(reasoning_effort="low")
+    assert reasoning == "" and "think first" in content, runtime
+
+    completion = await contract_client.chat.completions.create(
+        model="gpt-5.6-luna",
+        messages=messages,
+        extra_body={"reasoning": {"summary": "auto"}},
+    )
+    message = completion.choices[0].message
+    assert getattr(message, "reasoning_content", None) == summary, runtime
+    assert "think first" in (message.content or ""), runtime
 
 
 async def test_contract_chat_streams_parallel_tool_call_arguments(
