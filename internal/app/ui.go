@@ -345,6 +345,7 @@ func (s *server) uiStatus(w http.ResponseWriter, _ *http.Request) {
 		"default_model":  s.cfg.Model,
 		"codex_cli":      s.codexCLIPath() != "",
 		"signin":         s.device.snapshot(),
+		"activity":       pool.activitySnapshot(),
 	})
 }
 

@@ -382,7 +382,12 @@ choosing it under "Save as", replaces that account's login instead.
 For every account it shows whether the credentials actually work (not merely
 that a file exists), the email and plan, requests in flight, the usage windows
 Codex reports, and any cooldown with its reason. Each account can be disabled,
-enabled or removed there.
+enabled or removed there. A usage window is named by its length when Codex
+says it, since a plan with only a weekly limit reports that one first.
+
+`GET /ui/api/status` also carries `activity`: the last hour's requests,
+failures and failovers, with tokens per model. It is kept in memory, counts
+HTTP requests (not turns on a WebSocket), and starts empty after a restart.
 
 ### Access control
 

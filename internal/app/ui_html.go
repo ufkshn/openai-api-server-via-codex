@@ -265,6 +265,15 @@ const uiHTML = `<!doctype html>
       (resets ? '<div class="acct-meta" style="margin-left:100px">resets in ' + until(resets) + '</div>' : '');
   }
 
+  // A window is named by its length when Codex says it: a plan with only a
+  // weekly limit reports it first, where the 5-hour one usually is.
+  function windowName(minutes, fallback) {
+    if (!minutes) { return fallback; }
+    if (minutes === 300) { return '5h window'; }
+    if (minutes === 10080) { return 'Weekly'; }
+    return minutes % 1440 === 0 ? (minutes / 1440) + 'd window' : Math.round(minutes / 60) + 'h window';
+  }
+
   function accountState(a) {
     if (!a.enabled) { return ['Disabled', 'muted']; }
     if (!a.signed_in) { return ['Signed out', 'bad']; }
@@ -287,8 +296,8 @@ const uiHTML = `<!doctype html>
     html += '<div class="acct-head"><span class="acct-name">' + esc(name) + '</span>' +
       '<span class="pill ' + state[1] + '">' + esc(state[0]) + '</span></div>';
     html += '<div class="acct-meta">' + esc(meta.join(' · ')) + '</div>';
-    html += meter('5h window', a.primary_used_percent, a.primary_resets_at);
-    html += meter('Weekly', a.secondary_used_percent, a.secondary_resets_at);
+    html += meter(windowName(a.primary_window_minutes, '5h window'), a.primary_used_percent, a.primary_resets_at);
+    html += meter(windowName(a.secondary_window_minutes, 'Weekly'), a.secondary_used_percent, a.secondary_resets_at);
     var problem = !a.signed_in ? a.error : a.last_error;
     if (problem) { html += '<div class="acct-meta bad" style="margin-top:6px">' + esc(problem) + '</div>'; }
     html += '<div class="acct-actions">' +

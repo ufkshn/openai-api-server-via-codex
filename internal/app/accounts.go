@@ -75,7 +75,43 @@ type accountUsage struct {
 	HasSecondary     bool
 	PrimaryResetAt   time.Time
 	SecondaryResetAt time.Time
-	UpdatedAt        time.Time
+	// How long each window is, when Codex says. "Primary" and "secondary" are
+	// positions, not lengths: a plan with only a weekly limit reports it as
+	// primary, so whoever labels a window must go by its length.
+	PrimaryWindowMinutes   int
+	SecondaryWindowMinutes int
+	UpdatedAt              time.Time
+}
+
+// usageWindow is one of the two windows as Codex reported it.
+type usageWindow struct {
+	percent float64
+	reset   time.Time
+	minutes int
+	ok      bool
+}
+
+// resetTime is when a window starts over. Codex sends zero for a window that
+// has nothing to reset; that is no reset time, not "now".
+func resetTime(at, after float64, hasAt, hasAfter bool, now time.Time) time.Time {
+	if hasAt && at > 0 {
+		return time.Unix(int64(at), 0)
+	}
+	if hasAfter && after > 0 {
+		return now.Add(time.Duration(after) * time.Second)
+	}
+	return time.Time{}
+}
+
+func usageFromWindows(primary, secondary usageWindow, now time.Time) (accountUsage, bool) {
+	if !primary.ok && !secondary.ok {
+		return accountUsage{}, false
+	}
+	return accountUsage{
+		PrimaryPercent: primary.percent, PrimaryResetAt: primary.reset, PrimaryWindowMinutes: primary.minutes, HasPrimary: primary.ok,
+		SecondaryPercent: secondary.percent, SecondaryResetAt: secondary.reset, SecondaryWindowMinutes: secondary.minutes, HasSecondary: secondary.ok,
+		UpdatedAt: now,
+	}, true
 }
 
 type poolAccount struct {
@@ -112,6 +148,7 @@ type accountPool struct {
 	disabled      map[string]bool
 	scannedAt     time.Time
 	affinity      map[string]affinityEntry
+	activity      activityLog
 	now           func() time.Time
 }
 
@@ -553,27 +590,21 @@ func cooldownForStatus(status int, header http.Header, body []byte, now time.Tim
 // usageFromHeaders reads the x-codex-{primary,secondary}-* headers Codex
 // attaches to its responses.
 func usageFromHeaders(h http.Header, now time.Time) (accountUsage, bool) {
-	var usage accountUsage
-	read := func(window string) (float64, time.Time, bool) {
-		percent, err := strconv.ParseFloat(strings.TrimSpace(h.Get("x-codex-"+window+"-used-percent")), 64)
-		if err != nil {
-			return 0, time.Time{}, false
-		}
-		var reset time.Time
-		if at, err := strconv.ParseFloat(strings.TrimSpace(h.Get("x-codex-"+window+"-reset-at")), 64); err == nil && at > 0 {
-			reset = time.Unix(int64(at), 0)
-		} else if after, err := strconv.ParseFloat(strings.TrimSpace(h.Get("x-codex-"+window+"-reset-after-seconds")), 64); err == nil && after >= 0 {
-			reset = now.Add(time.Duration(after) * time.Second)
-		}
-		return percent, reset, true
+	number := func(name string) (float64, bool) {
+		value, err := strconv.ParseFloat(strings.TrimSpace(h.Get(name)), 64)
+		return value, err == nil
 	}
-	usage.PrimaryPercent, usage.PrimaryResetAt, usage.HasPrimary = read("primary")
-	usage.SecondaryPercent, usage.SecondaryResetAt, usage.HasSecondary = read("secondary")
-	if !usage.HasPrimary && !usage.HasSecondary {
-		return usage, false
+	read := func(window string) usageWindow {
+		percent, ok := number("x-codex-" + window + "-used-percent")
+		if !ok {
+			return usageWindow{}
+		}
+		at, hasAt := number("x-codex-" + window + "-reset-at")
+		after, hasAfter := number("x-codex-" + window + "-reset-after-seconds")
+		minutes, _ := number("x-codex-" + window + "-window-minutes")
+		return usageWindow{percent: percent, reset: resetTime(at, after, hasAt, hasAfter, now), minutes: int(minutes), ok: true}
 	}
-	usage.UpdatedAt = now
-	return usage, true
+	return usageFromWindows(read("primary"), read("secondary"), now)
 }
 
 // usageFromEvent reads a `codex.rate_limits` stream event.
@@ -585,28 +616,18 @@ func usageFromEvent(event map[string]any, now time.Time) (accountUsage, bool) {
 	if limits == nil {
 		limits = event
 	}
-	var usage accountUsage
-	read := func(raw any) (float64, time.Time, bool) {
+	read := func(raw any) usageWindow {
 		window := mapAny(raw)
 		percent, ok := numberValue(window["used_percent"])
 		if !ok {
-			return 0, time.Time{}, false
+			return usageWindow{}
 		}
-		var reset time.Time
-		if at, ok := numberValue(window["resets_at"]); ok && at > 0 {
-			reset = time.Unix(int64(at), 0)
-		} else if after, ok := numberValue(window["reset_after_seconds"]); ok {
-			reset = now.Add(time.Duration(after) * time.Second)
-		}
-		return percent, reset, true
+		at, hasAt := numberValue(window["resets_at"])
+		after, hasAfter := numberValue(window["reset_after_seconds"])
+		minutes, _ := numberValue(window["window_minutes"])
+		return usageWindow{percent: percent, reset: resetTime(at, after, hasAt, hasAfter, now), minutes: int(minutes), ok: true}
 	}
-	usage.PrimaryPercent, usage.PrimaryResetAt, usage.HasPrimary = read(limits["primary"])
-	usage.SecondaryPercent, usage.SecondaryResetAt, usage.HasSecondary = read(limits["secondary"])
-	if !usage.HasPrimary && !usage.HasSecondary {
-		return usage, false
-	}
-	usage.UpdatedAt = now
-	return usage, true
+	return usageFromWindows(read(limits["primary"]), read(limits["secondary"]), now)
 }
 
 func numberValue(v any) (float64, bool) {
@@ -880,11 +901,17 @@ func (p *accountPool) snapshot() []map[string]any {
 			if !acct.usage.PrimaryResetAt.IsZero() {
 				entry["primary_resets_at"] = acct.usage.PrimaryResetAt.UTC().Format(time.RFC3339)
 			}
+			if acct.usage.PrimaryWindowMinutes > 0 {
+				entry["primary_window_minutes"] = acct.usage.PrimaryWindowMinutes
+			}
 		}
 		if acct.usage.HasSecondary {
 			entry["secondary_used_percent"] = acct.usage.SecondaryPercent
 			if !acct.usage.SecondaryResetAt.IsZero() {
 				entry["secondary_resets_at"] = acct.usage.SecondaryResetAt.UTC().Format(time.RFC3339)
+			}
+			if acct.usage.SecondaryWindowMinutes > 0 {
+				entry["secondary_window_minutes"] = acct.usage.SecondaryWindowMinutes
 			}
 		}
 		p.mu.Unlock()

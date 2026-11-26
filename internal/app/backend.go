@@ -311,6 +311,7 @@ func (b *backend) doAuthenticatedWith(client *http.Client, hints routeHints, mak
 			if d, reason, ok := cooldownForStatus(resp.StatusCode, resp.Header, body, time.Now()); ok {
 				b.pool.coolDown(lease.acct, d, reason, fmt.Sprintf("Codex answered HTTP %d", resp.StatusCode))
 				log.Printf("codex.account.failover account=%s status=%d", lease.id(), resp.StatusCode)
+				b.pool.recordFailover()
 				exclude[lease.id()] = true
 				lease.release()
 				refused, refusedLease = resp, lease
@@ -462,7 +463,23 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 
 // streamWithRetries holds every event until the terminal one when holdOutput is
 // set, for a caller that shows the client nothing until the response is complete.
-func (b *backend) streamWithRetries(ctx context.Context, payload map[string]any, holdOutput bool, fn func(map[string]any) error) error {
+func (b *backend) streamWithRetries(ctx context.Context, payload map[string]any, holdOutput bool, fn func(map[string]any) error) (result error) {
+	// One client request is one line of the console's activity, however many
+	// attempts and accounts it took.
+	record := requestRecord{model: stringValue(payload["model"])}
+	if record.model == "" {
+		record.model = b.cfg.Model
+	}
+	deliver := fn
+	fn = func(event map[string]any) error {
+		record.observe(event)
+		return deliver(event)
+	}
+	defer func() {
+		// A client that hung up did not get an answer, but nothing failed either.
+		record.failed = !record.answered && result != nil && ctx.Err() == nil
+		b.pool.recordRequest(record)
+	}()
 	for attempt := 0; ; attempt++ {
 		var held []map[string]any
 		var retryable, pending error
