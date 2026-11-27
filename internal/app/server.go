@@ -378,6 +378,7 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request, imagegen
 		return
 	}
 	delete(body, "background")
+	keep := storeRequested(body)
 	prepared := prepareResponse(body, s.cfg.Model)
 	previous := stringValue(prepared["previous_response_id"])
 	if previous != "" {
@@ -391,11 +392,11 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request, imagegen
 	downstream := cloneMap(prepared)
 	delete(downstream, "previous_response_id")
 	if imagegen && imageGenerationTool(downstream) != nil {
-		s.imagegenResponse(w, r, prepared, downstream, previous, boolValue(body["stream"]))
+		s.imagegenResponse(w, r, prepared, downstream, previous, keep, boolValue(body["stream"]))
 		return
 	}
 	if boolValue(body["stream"]) {
-		s.streamResponse(w, r, prepared, downstream, previous)
+		s.streamResponse(w, r, prepared, downstream, previous, keep)
 		return
 	}
 	if !s.acquireRequest(w, r) {
@@ -411,11 +412,24 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request, imagegen
 	if previous != "" {
 		response["previous_response_id"] = previous
 	}
-	s.responses.remember(stringValue(response["id"]), sliceAny(prepared["input"]), response)
+	if keep {
+		s.responses.remember(stringValue(response["id"]), sliceAny(prepared["input"]), response)
+	}
 	writeJSON(w, 200, response)
 }
 
-func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, prepared, downstream map[string]any, previous string) {
+// storeRequested reports whether the client lets this response be kept for
+// previous_response_id and GET /v1/responses/{id}. Like OpenAI, only an
+// explicit `store: false` opts out. A kept response holds the whole input twice
+// as decoded JSON, so a client that resends its history every turn and sends
+// `store: false` (Hermes) would otherwise fill memory with copies nobody reads:
+// 1,000 of them reached 4.8 GB in production on 2026-11-27.
+func storeRequested(body map[string]any) bool {
+	stored, ok := body["store"].(bool)
+	return !ok || stored
+}
+
+func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, prepared, downstream map[string]any, previous string, keep bool) {
 	setSSE(w)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -445,7 +459,9 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, prepared
 				}
 				event["response"] = response
 				if !stored {
-					s.responses.remember(stringValue(response["id"]), sliceAny(prepared["input"]), response)
+					if keep {
+						s.responses.remember(stringValue(response["id"]), sliceAny(prepared["input"]), response)
+					}
 					stored = true
 				}
 			}

@@ -648,7 +648,8 @@ client = OpenAI(base_url="http://127.0.0.1:8080/imagegen/v1", api_key="...")
 - non-streaming and streaming Responses and Chat Completions
 - Responses WebSocket relay with upstream conversation state, async tools, and
   mid-turn steering ([usage and Codex limitations](docs/websocket-mode.md))
-- `previous_response_id` backed by bounded local context
+- `previous_response_id` backed by bounded local context; a request with
+  `store: false` is not kept, so it cannot be continued or retrieved later
 - stored Chat list/retrieve/update/delete/messages APIs
 - Responses retrieve streaming, delete, cancel, and input-token count
 - function/tool calling and streamed tool arguments

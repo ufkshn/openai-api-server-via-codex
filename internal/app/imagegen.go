@@ -305,6 +305,7 @@ type imagegenRun struct {
 	s        *server
 	prepared map[string]any
 	previous string
+	keep     bool           // the client allows storing the response (storeRequested)
 	settings map[string]any // the caller's image_generation tool
 	base     []any          // the request's input
 	context  []any          // what the rounds added after it, as upstream input
@@ -320,9 +321,9 @@ type imagegenRun struct {
 
 // imagegenResponse runs the CLI's drawing loop for a /responses request that
 // offers the image_generation tool.
-func (s *server) imagegenResponse(w http.ResponseWriter, r *http.Request, prepared, downstream map[string]any, previous string, stream bool) {
+func (s *server) imagegenResponse(w http.ResponseWriter, r *http.Request, prepared, downstream map[string]any, previous string, keep, stream bool) {
 	run := &imagegenRun{
-		s: s, prepared: prepared, previous: previous, settings: imageGenerationTool(downstream),
+		s: s, prepared: prepared, previous: previous, keep: keep, settings: imageGenerationTool(downstream),
 		base: sliceAny(downstream["input"]), limit: intValue(downstream["max_tool_calls"]),
 	}
 	if run.limit <= 0 {
@@ -603,10 +604,12 @@ func (run *imagegenRun) finish(final map[string]any) map[string]any {
 		response["previous_response_id"] = run.previous
 	}
 	id := stringValue(response["id"])
-	run.s.responses.remember(id, sliceAny(run.prepared["input"]), response)
-	// A follow-up continues from what the model really saw — its imagegen calls
-	// and their outputs — rather than from the image items the client was shown.
-	run.s.responses.setContext(id, append(cloneSlice(sliceAny(run.prepared["input"])), run.context...))
+	if run.keep {
+		run.s.responses.remember(id, sliceAny(run.prepared["input"]), response)
+		// A follow-up continues from what the model really saw — its imagegen calls
+		// and their outputs — rather than from the image items the client was shown.
+		run.s.responses.setContext(id, append(cloneSlice(sliceAny(run.prepared["input"])), run.context...))
+	}
 	eventType := "response.completed"
 	if stringValue(response["status"]) == "incomplete" {
 		eventType = "response.incomplete"
